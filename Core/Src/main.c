@@ -38,8 +38,8 @@
 typedef struct {
   uint32_t total_us;       /* all writes + syncs + close */
   uint32_t kb_per_s;
-  uint32_t avg_sector_us;  /* average 512-byte f_write */
-  uint32_t max_sector_us;  /* slowest f_write: card busy pauses show up here */
+  uint32_t avg_write_us;   /* average f_write of SPEED_CHUNK_BYTES */
+  uint32_t max_write_us;   /* slowest f_write of SPEED_CHUNK_BYTES: card busy pauses show up here */
   uint32_t max_sync_us;    /* slowest f_sync: FAT + directory update */
 } SdSpeed;
 
@@ -148,7 +148,7 @@ static uint8_t sd_speed_test(void)
       return 5;
     }
     sum_write_us += us;
-    if (us > sd_speed.max_sector_us) sd_speed.max_sector_us = us;
+    if (us > sd_speed.max_write_us) sd_speed.max_write_us = us;
 
     if ((i * SPEED_CHUNK_BYTES) % SPEED_SYNC_BYTES == 0) {
       t = DWT->CYCCNT;
@@ -166,15 +166,15 @@ static uint8_t sd_speed_test(void)
 
   sd_speed.total_us = us_since(t_all);
   sd_speed.kb_per_s = (uint32_t)(SPEED_TEST_KB * 1000000ULL / sd_speed.total_us);
-  sd_speed.avg_sector_us = sum_write_us / (SPEED_TEST_KB * 2);
+  sd_speed.avg_write_us = sum_write_us / chunks;
 
   sd_test_result = f_open(&USERFile, "SPEED.CSV", FA_OPEN_APPEND | FA_WRITE);
   if (sd_test_result != FR_OK) return 5;
   if (f_size(&USERFile) == 0)
-    n = snprintf(line, sizeof line, "kb,total_ms,kb_per_s,avg_sector_us,max_sector_us,max_sync_us\r\n");
+    n = snprintf(line, sizeof line, "kb,total_ms,kb_per_s,avg_write_us,max_write_us,max_sync_us\r\n");
   n += snprintf(line + n, sizeof line - n, "%d,%lu,%lu,%lu,%lu,%lu\r\n", SPEED_TEST_KB,
                 (unsigned long)(sd_speed.total_us / 1000), (unsigned long)sd_speed.kb_per_s,
-                (unsigned long)sd_speed.avg_sector_us, (unsigned long)sd_speed.max_sector_us,
+                (unsigned long)sd_speed.avg_write_us, (unsigned long)sd_speed.max_write_us,
                 (unsigned long)sd_speed.max_sync_us);
   sd_test_result = f_write(&USERFile, line, n, &written);
   if (sd_test_result != FR_OK || written != (UINT)n) {
@@ -295,7 +295,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
