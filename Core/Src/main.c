@@ -39,7 +39,7 @@ typedef struct {
   uint32_t total_us;       /* all writes + syncs + close */
   uint32_t kb_per_s;
   uint32_t avg_sector_us;  /* average 512-byte f_write */
-  uint32_t max_sector_us;  /* slowest 512-byte f_write: card busy pauses show up here */
+  uint32_t max_sector_us;  /* slowest f_write: card busy pauses show up here */
   uint32_t max_sync_us;    /* slowest f_sync: FAT + directory update */
 } SdSpeed;
 
@@ -54,7 +54,8 @@ typedef struct {
 #endif
 
 #define SPEED_TEST_KB     256   /* how much the speed test writes */
-#define SPEED_SYNC_EVERY  64    /* f_sync after this many 512-byte sectors (64 = 32 KB buffer) */
+#define SPEED_CHUNK_BYTES 8192
+#define SPEED_SYNC_BYTES 32768
 
 /* USER CODE END PD */
 
@@ -116,39 +117,40 @@ static uint32_t us_since(uint32_t start)
   return (DWT->CYCCNT - start) / (SystemCoreClock / 1000000U);
 }
 
-/* Write-speed test: writes SPEED_TEST_KB to SPEED.BIN in 512-byte pieces (the way
- * the logger will), with an f_sync every SPEED_SYNC_EVERY sectors. Results go to
+/* Write-speed test: writes SPEED_TEST_KB to SPEED.BIN in SPEED_CHUNK_BYTES pieces (the way
+ * the logger will), with an f_sync every SPEED_SYNC_BYTES bytes. Results go to
  * sd_speed and one line is appended to SPEED.CSV. Returns 0 on success, 5 on failure. */
 static uint8_t sd_speed_test(void)
 {
-  static uint8_t sector[512];
+  static uint8_t buf[SPEED_CHUNK_BYTES] __attribute__((aligned(4)));
   char line[128];
   uint32_t t_all, t, us, sum_write_us = 0, i;
   UINT written;
+  const uint32_t chunks = SPEED_TEST_KB * 1024U / SPEED_CHUNK_BYTES;
   int n = 0;
 
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   /* turn on the cycle counter */
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  for (i = 0; i < sizeof sector; i++) sector[i] = (uint8_t)i;
+  for (i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)i;
 
   sd_test_result = f_open(&USERFile, "SPEED.BIN", FA_CREATE_ALWAYS | FA_WRITE);
   if (sd_test_result != FR_OK) return 5;
 
   t_all = DWT->CYCCNT;
-  for (i = 1; i <= SPEED_TEST_KB * 2; i++) {
+  for (i = 1; i <= chunks; i++) {
     t = DWT->CYCCNT;
-    sd_test_result = f_write(&USERFile, sector, sizeof sector, &written);
+    sd_test_result = f_write(&USERFile, buf, sizeof buf, &written);
     us = us_since(t);
-    if (sd_test_result != FR_OK || written != sizeof sector) {
+    if (sd_test_result != FR_OK || written != sizeof buf) {
       f_close(&USERFile);
       return 5;
     }
     sum_write_us += us;
     if (us > sd_speed.max_sector_us) sd_speed.max_sector_us = us;
 
-    if (i % SPEED_SYNC_EVERY == 0) {
+    if ((i * SPEED_CHUNK_BYTES) % SPEED_SYNC_BYTES == 0) {
       t = DWT->CYCCNT;
       sd_test_result = f_sync(&USERFile);
       us = us_since(t);
