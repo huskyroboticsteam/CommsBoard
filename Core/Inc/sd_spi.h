@@ -22,12 +22,11 @@
 #define SD_USE_CARD_DETECT 0
 #endif
 
-/* SPI1 runs from PCLK2 = 170 MHz.
- * Slow: /256 = ~664 kHz, the slowest SPI1 can go. The SD spec asks for <= 400 kHz
- * during start-up; most cards accept this. If a card won't start, lower PCLK2.
- * Fast: /16 = ~10.6 MHz for breadboard wires. Use /8 (~21 MHz) on the real PCB. */
+/* SPI1 runs from PCLK2 = 85 MHz (APB2 divider /2).
+ * Slow: /256 = ~332 kHz, under the 400 kHz the SD spec asks for during start-up.
+ * Fast: /8 = ~10.6 MHz for breadboard wires. Use /4 (~21 MHz) on the real PCB. */
 #define SD_PRESCALER_SLOW SPI_BAUDRATEPRESCALER_256
-#define SD_PRESCALER_FAST SPI_BAUDRATEPRESCALER_16
+#define SD_PRESCALER_FAST SPI_BAUDRATEPRESCALER_8
 
 typedef enum {
   SD_OK = 0,
