@@ -74,7 +74,7 @@ void HAL_COMP_MspInit(COMP_HandleTypeDef* compHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* COMP1 interrupt Init */
-    HAL_NVIC_SetPriority(COMP1_2_3_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(COMP1_2_3_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(COMP1_2_3_IRQn);
   /* USER CODE BEGIN COMP1_MspInit 1 */
 

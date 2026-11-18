@@ -57,8 +57,16 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define SD_DETECT_Pin GPIO_PIN_4
-#define SD_DETECT_GPIO_Port GPIOC
+#define LED_HB_Pin GPIO_PIN_0
+#define LED_HB_GPIO_Port GPIOC
+#define LED_CAN_Pin GPIO_PIN_1
+#define LED_CAN_GPIO_Port GPIOC
+#define LED_SD_Pin GPIO_PIN_2
+#define LED_SD_GPIO_Port GPIOC
+#define LED_FAULT_Pin GPIO_PIN_3
+#define LED_FAULT_GPIO_Port GPIOC
+#define SD_CS_Pin GPIO_PIN_4
+#define SD_CS_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

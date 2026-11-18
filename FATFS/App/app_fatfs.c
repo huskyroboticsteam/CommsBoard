@@ -23,7 +23,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "timekeeping.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -103,9 +103,7 @@ int32_t MX_FATFS_Process(void)
 DWORD get_fattime(void)
 {
   /* USER CODE BEGIN get_fattime */
-  /* No RTC read yet: return a fixed, valid time (2026-11-09 00:00:00) so file dates are
-   * not invalid. Bit layout: year-1980 <<25 | month <<21 | day <<16 | hour <<11 | min <<5 | sec/2 */
-  return ((DWORD)(2026 - 1980) << 25) | ((DWORD)11 << 21) | ((DWORD)9 << 16);
+  return tk_fattime();
   /* USER CODE END get_fattime */
 }
 
