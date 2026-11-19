@@ -33,7 +33,7 @@ static void print_stats(void)
 {
   static uint32_t last_rx, last_tx, last_writes;
   static uint64_t last_bytes, last_sum_us;
-  static char line[240];
+  static char line[280];
   can_stats_t can;
   can_task_stats_t ct;
   logger_stats_t lg;
@@ -49,8 +49,8 @@ static void print_stats(void)
 
   n = snprintf(line, sizeof line,
                "[%lus] %s b%lu p%lu | rx %lu/s tx %lu/s drop %lu+%lu txfail %lu | ring hi %lu/%lu | "
-               "sd avg %luus max %luus err %lu | json %lu B/s | can %s tec %u rec %u | "
-               "stack free %lu\r\n",
+               "sd avg %luus max %luus err %lu poll %lu | json %lu B/s | can %s tec %u rec %u | "
+               "gap %luus | stack free %lu\r\n",
                (unsigned long)(timebase_now_us() / 1000000u), STATE_NAME[lg.state],
                (unsigned long)lg.boot_id, (unsigned long)lg.part,
                (unsigned long)((can.rx_frames - last_rx) / secs), (unsigned long)((can.tx_frames - last_tx) / secs),
@@ -58,8 +58,10 @@ static void print_stats(void)
                (unsigned long)(ct.tx_queue_full + ct.tx_refused),
                (unsigned long)log_ring.high_water, (unsigned long)(LOG_RING_RECORDS - 1),
                (unsigned long)avg_us, (unsigned long)sd.write_max_us, (unsigned long)sd.errors,
+               (unsigned long)sd.polled_blocks,    /* blocks that could not go by DMA: should stay 0 */
                (unsigned long)((lg.bytes - last_bytes) / secs),
                CAN_STATE[can.state & 3], can.tec, can.rec,
+               (unsigned long)app_can_gap_max_us(),   /* longest wait between CAN job runs since the last line */
                (unsigned long)board_stack_free());   /* bytes of stack never used so far */
   if (n > 0) dbg_write(line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 

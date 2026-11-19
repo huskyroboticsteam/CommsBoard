@@ -60,6 +60,7 @@ ringbuf_t log_ring;
 /* ---------------- SD card emulator (SDHC, SPI mode) ---------------- */
 static uint8_t *img;                   /* CARD_SECTORS * 512 bytes of shared memory */
 static int cs_low, reject_writes;
+static int read_delay;                 /* 0xFF bytes the card sends before read data (a slow card) */
 static uint8_t q[2048]; static unsigned qh, qt;      /* bytes the card will send */
 static uint8_t cmd[6]; static int cmdlen;
 static int idle, app, acmd41_calls;
@@ -99,7 +100,9 @@ static void do_cmd(void)
     return;
   }
   if (c == 17 || c == 18) {
-    put(0); put_block(arg);
+    put(0);
+    for (int i = 0; i < read_delay; i++) put(0xFF);
+    put_block(arg);
     if (c == 18) { rd_multi = 1; rd_addr = arg + 1; }
     return;
   }
@@ -253,8 +256,12 @@ static uint32_t pull(const char *name)
   return total;
 }
 
+static int yields;
+static void count_yield(uint32_t ms_left) { (void)ms_left; yields++; }
+
 int main(void)
 {
+  static const SD_Hooks count_hooks = { count_yield, NULL };
   static uint8_t work[4096];
   const uint32_t part_size = LOG_PREALLOC_MB * 1024u * 1024u;
   uint32_t free_mb, max_boot;
@@ -268,6 +275,14 @@ int main(void)
   /* A blank card, freshly formatted. */
   assert(MX_FATFS_Init() == APP_OK);
   assert(SD_Init() == SD_OK && SD_GetSectorCount() == CARD_SECTORS);
+
+  /* Every loop in the driver that waits on the card must let other work run. */
+  SD_SetHooks(&count_hooks);
+  assert(SD_Init() == SD_OK && yields >= 2);          /* start-up: the card said "not ready" twice */
+  yields = 0;
+  read_delay = 50;                                    /* a card that is slow to produce read data */
+  assert(SD_ReadBlocks(work, 0, 1) == SD_OK && yields > 0);
+  read_delay = 0;
   assert(f_mkfs(USERPath, FM_ANY, 0, work, sizeof work) == FR_OK);
 
   /* Boot 1: a short session. */

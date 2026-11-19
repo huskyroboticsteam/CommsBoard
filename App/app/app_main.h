@@ -17,7 +17,17 @@
 void app_main(void);        /* once, after the MX_..._Init calls */
 void app_loop(void);        /* one pass of the main loop */
 
-void app_yield(void);       /* run the jobs that must not wait for the SD card */
+/* Run the jobs that must not wait for the SD card (CAN routing and status).
+ *
+ * RULE: this is called from deep inside the SD driver, in the middle of a FatFs call.
+ * Nothing it runs may touch FatFs, storage, the SD driver or the logger - FatFs would
+ * re-enter itself and corrupt the card. Anything can_task_poll() or status_poll() ever
+ * wants written to the card must go through the log ring. */
+void app_yield(void);
+
+/* Longest time between two runs of the CAN job since this was last called (us). */
+uint32_t app_can_gap_max_us(void);
+
 void app_fatal(void);       /* stop and let the watchdog reset us */
 
 /* ---- CAN routing (can_task.c) ---- */
