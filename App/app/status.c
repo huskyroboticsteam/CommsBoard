@@ -12,9 +12,9 @@
 #include "config.h"
 #include "can_drv.h"
 #include "dbg_uart.h"
+#include "fmt.h"
 #include "sd_spi.h"
 #include "timebase.h"
-#include <stdio.h>
 
 #define TICK_MS 100
 
@@ -28,18 +28,19 @@ void wdg_checkin(void)
 static const char *const STATE_NAME[] = { "INIT", "OPEN", "LOGGING", "FAULT", "CARD_FULL" };
 static const char *const CAN_STATE[] = { "ok", "warn", "passive", "busoff" };
 
-/* One line every STATS_PRINT_MS. Rates are averages since the previous line. */
+/* One line every STATS_PRINT_MS. Rates are averages since the previous line.
+ * Built with fmt.h, not snprintf, so that malloc stays out of the firmware. */
 static void print_stats(void)
 {
   static uint32_t last_rx, last_tx, last_writes;
   static uint64_t last_bytes, last_sum_us;
-  static char line[280];
+  static char line[400];      /* worst case is about 365 characters: 21 numbers of up to 10 digits */
   can_stats_t can;
   can_task_stats_t ct;
   logger_stats_t lg;
   SD_Stats sd = *SD_GetStats();   /* read-only, so allowed here: see the rule on app_yield() */
   uint32_t secs = STATS_PRINT_MS / 1000, writes, avg_us;
-  int n;
+  char *p = line;
 
   can_drv_get_stats(&can);
   can_task_get_stats(&ct);
@@ -47,23 +48,29 @@ static void print_stats(void)
   writes = sd.writes - last_writes;
   avg_us = writes ? (uint32_t)((sd.write_sum_us - last_sum_us) / writes) : 0;
 
-  n = snprintf(line, sizeof line,
-               "[%lus] %s b%lu p%lu | rx %lu/s tx %lu/s drop %lu+%lu txfail %lu | ring hi %lu/%lu | "
-               "sd avg %luus max %luus err %lu poll %lu | json %lu B/s | can %s tec %u rec %u | "
-               "gap %luus | stack free %lu\r\n",
-               (unsigned long)(timebase_now_us() / 1000000u), STATE_NAME[lg.state],
-               (unsigned long)lg.boot_id, (unsigned long)lg.part,
-               (unsigned long)((can.rx_frames - last_rx) / secs), (unsigned long)((can.tx_frames - last_tx) / secs),
-               (unsigned long)can.rx_dropped, (unsigned long)ct.log_dropped,
-               (unsigned long)(ct.tx_queue_full + ct.tx_refused),
-               (unsigned long)log_ring.high_water, (unsigned long)(LOG_RING_RECORDS - 1),
-               (unsigned long)avg_us, (unsigned long)sd.write_max_us, (unsigned long)sd.errors,
-               (unsigned long)sd.polled_blocks,    /* blocks that could not go by DMA: should stay 0 */
-               (unsigned long)((lg.bytes - last_bytes) / secs),
-               CAN_STATE[can.state & 3], can.tec, can.rec,
-               (unsigned long)app_can_gap_max_us(),   /* longest wait between CAN job runs since the last line */
-               (unsigned long)board_stack_free());   /* bytes of stack never used so far */
-  if (n > 0) dbg_write(line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+  p = fmt_str(p, "[");            p = fmt_u32(p, (uint32_t)(timebase_now_us() / 1000000u));
+  p = fmt_str(p, "s] ");          p = fmt_str(p, STATE_NAME[lg.state]);
+  p = fmt_str(p, " b");           p = fmt_u32(p, lg.boot_id);
+  p = fmt_str(p, " p");           p = fmt_u32(p, lg.part);
+  p = fmt_str(p, " | rx ");       p = fmt_u32(p, (can.rx_frames - last_rx) / secs);
+  p = fmt_str(p, "/s tx ");       p = fmt_u32(p, (can.tx_frames - last_tx) / secs);
+  p = fmt_str(p, "/s drop ");     p = fmt_u32(p, can.rx_dropped);       /* lost in the interrupt */
+  p = fmt_str(p, "+");            p = fmt_u32(p, ct.log_dropped);       /* lost because the log ring was full */
+  p = fmt_str(p, " txfail ");     p = fmt_u32(p, ct.tx_queue_full + ct.tx_refused);
+  p = fmt_str(p, " | ring hi ");  p = fmt_u32(p, log_ring.high_water);
+  p = fmt_str(p, "/");            p = fmt_u32(p, LOG_RING_RECORDS - 1);
+  p = fmt_str(p, " | sd avg ");   p = fmt_u32(p, avg_us);
+  p = fmt_str(p, "us max ");      p = fmt_u32(p, sd.write_max_us);
+  p = fmt_str(p, "us err ");      p = fmt_u32(p, sd.errors);
+  p = fmt_str(p, " poll ");       p = fmt_u32(p, sd.polled_blocks);     /* blocks that could not go by DMA: should stay 0 */
+  p = fmt_str(p, " | json ");     p = fmt_u32(p, (uint32_t)((lg.bytes - last_bytes) / secs));
+  p = fmt_str(p, " B/s | can ");  p = fmt_str(p, CAN_STATE[can.state & 3]);
+  p = fmt_str(p, " tec ");        p = fmt_u32(p, can.tec);
+  p = fmt_str(p, " rec ");        p = fmt_u32(p, can.rec);
+  p = fmt_str(p, " | gap ");      p = fmt_u32(p, app_can_gap_max_us());  /* longest wait between CAN job runs since the last line */
+  p = fmt_str(p, "us | stack free "); p = fmt_u32(p, board_stack_free()); /* bytes of stack never used so far */
+  p = fmt_str(p, "\r\n");
+  dbg_write(line, (size_t)(p - line));
 
   last_rx = can.rx_frames;
   last_tx = can.tx_frames;

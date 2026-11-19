@@ -5,9 +5,6 @@ Release/
 # Per-user debugger config (contains local paths)
 *.launch
 
-# Local Claude Code settings
-.claude/
-
 .DS_Store
 
 # Written by tools/gen_version.sh at build time
