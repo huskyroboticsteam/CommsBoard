@@ -3,9 +3,10 @@
 
 uint64_t tk_extend_us(uint64_t now_us, uint32_t t_lo)
 {
-  /* How long ago the record was stamped, modulo 2^32 us. */
-  uint32_t age = (uint32_t)now_us - t_lo;
-  return now_us - age;
+  /* How long ago the record was stamped. Signed, because frames keep arriving while the
+   * logger works: a record can be stamped just after the logger read "now". */
+  int32_t age = (int32_t)((uint32_t)now_us - t_lo);
+  return now_us - (int64_t)age;
 }
 
 /* Days from 1970-01-01 to the given date (Howard Hinnant's days_from_civil). */

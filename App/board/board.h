@@ -8,7 +8,11 @@
 #ifndef BOARD_H
 #define BOARD_H
 
-#define BOARD_NUCLEO            /* or BOARD_COMMS_V1 */
+/* Which board this build is for. Pass -DBOARD_COMMS_V1 to the compiler for the real
+ * board; with no flag it is the Nucleo dev board. */
+#if !defined(BOARD_NUCLEO) && !defined(BOARD_COMMS_V1)
+#define BOARD_NUCLEO
+#endif
 
 #include "main.h"
 
@@ -28,8 +32,8 @@
 #define BOARD_CCM_START       0x20018000u
 
 /* Interrupt priorities (architecture v2, section 3). Lower number = more urgent.
- * Anything that calls a FreeRTOS FromISR function must be 5 or higher. CubeMX forces
- * every one of these to 5, so board_init() sets the real values. */
+ * The same values are set in CubeMX; board_init() applies these so that this file
+ * stays the one place to look. */
 #define BOARD_IRQ_PRIO_POWERFAIL  5
 #define BOARD_IRQ_PRIO_CAN        6
 #define BOARD_IRQ_PRIO_SD_DMA     7
@@ -43,6 +47,19 @@ void led_set(led_t led, int on);
 void led_toggle(led_t led);
 
 void board_init(void);                   /* priorities, debug freeze, reset cause */
+uint32_t board_stack_free(void);         /* bytes of the main stack that have never been used */
+
+/* Short critical sections: mask all interrupts, then put the mask back as it was. */
+static inline uint32_t board_irq_lock(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+static inline void board_irq_unlock(uint32_t primask)
+{
+  __set_PRIMASK(primask);
+}
 const char *board_reset_cause(void);     /* "POR", "PIN", "IWDG", "SW", ... for the log header */
 void board_watchdog_kick(void);
 void board_fatal(void);                  /* fault LED on, stop; the watchdog then resets us */

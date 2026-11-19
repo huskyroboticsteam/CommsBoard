@@ -1,6 +1,6 @@
 /**
   * logrec.h - the 16-byte binary record every event travels through RAM as.
-  * Records become JSON only in logger_task, right before writing (see jsonl.h).
+  * Records become JSON only in the logger, right before writing (see jsonl.h).
   * No HAL here: this compiles and runs in the PC unit tests.
   */
 #ifndef LOGREC_H

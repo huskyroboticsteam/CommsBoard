@@ -1,9 +1,11 @@
 /**
   * status.c - heartbeat LED, fault LED, watchdog, and the stats line on the debug UART.
   *
-  * Watchdog: every task sets its bit each time round its loop. This task refreshes the
-  * hardware watchdog only when all bits are set, then clears them. A task that hangs
-  * stops setting its bit, the refresh stops, and the MCU resets after about 2 s.
+  * Watchdog: the firmware "checks in" whenever it makes progress: the main loop finished
+  * a pass, or the SD card answered a command. Every 100 ms this job refreshes the
+  * hardware watchdog only if there was a check-in since the last refresh. If the main
+  * loop hangs, the check-ins stop (or this job stops being called), and the MCU resets
+  * after about 2 s.
   */
 #include "app_main.h"
 #include "board.h"
@@ -12,16 +14,15 @@
 #include "dbg_uart.h"
 #include "sd_spi.h"
 #include "timebase.h"
-#include "cmsis_os.h"
 #include <stdio.h>
 
 #define TICK_MS 100
 
-static uint32_t checkins;
+static uint8_t checked_in;
 
-void wdg_checkin(uint32_t task_bit)
+void wdg_checkin(void)
 {
-  __atomic_fetch_or(&checkins, task_bit, __ATOMIC_RELAXED);
+  checked_in = 1;
 }
 
 static const char *const STATE_NAME[] = { "INIT", "OPEN", "LOGGING", "FAULT", "CARD_FULL" };
@@ -32,7 +33,7 @@ static void print_stats(void)
 {
   static uint32_t last_rx, last_tx, last_writes;
   static uint64_t last_bytes, last_sum_us;
-  static char line[200];      /* static: keeps this task's 1 KB stack for snprintf */
+  static char line[240];
   can_stats_t can;
   can_task_stats_t ct;
   logger_stats_t lg;
@@ -47,16 +48,19 @@ static void print_stats(void)
   avg_us = writes ? (uint32_t)((sd.write_sum_us - last_sum_us) / writes) : 0;
 
   n = snprintf(line, sizeof line,
-               "[%lus] %s b%lu p%lu | rx %lu/s tx %lu/s drop %lu+%lu | ring hi %lu/%lu | "
-               "sd avg %luus max %luus err %lu | json %lu B/s | can %s tec %u rec %u\r\n",
+               "[%lus] %s b%lu p%lu | rx %lu/s tx %lu/s drop %lu+%lu txfail %lu | ring hi %lu/%lu | "
+               "sd avg %luus max %luus err %lu | json %lu B/s | can %s tec %u rec %u | "
+               "stack free %lu\r\n",
                (unsigned long)(timebase_now_us() / 1000000u), STATE_NAME[lg.state],
                (unsigned long)lg.boot_id, (unsigned long)lg.part,
                (unsigned long)((can.rx_frames - last_rx) / secs), (unsigned long)((can.tx_frames - last_tx) / secs),
                (unsigned long)can.rx_dropped, (unsigned long)ct.log_dropped,
+               (unsigned long)(ct.tx_queue_full + ct.tx_refused),
                (unsigned long)log_ring.high_water, (unsigned long)(LOG_RING_RECORDS - 1),
                (unsigned long)avg_us, (unsigned long)sd.write_max_us, (unsigned long)sd.errors,
                (unsigned long)((lg.bytes - last_bytes) / secs),
-               CAN_STATE[can.state & 3], can.tec, can.rec);
+               CAN_STATE[can.state & 3], can.tec, can.rec,
+               (unsigned long)board_stack_free());   /* bytes of stack never used so far */
   if (n > 0) dbg_write(line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 
   last_rx = can.rx_frames;
@@ -66,28 +70,26 @@ static void print_stats(void)
   last_bytes = lg.bytes;
 }
 
-void status_task(void *argument)
+void status_poll(void)
 {
+  static uint32_t last_ms, ticks;
   logger_stats_t lg;
-  uint32_t ticks = 0;
 
-  (void)argument;
-  for (;;) {
-    osDelay(TICK_MS);
-    ticks++;
+  if (timebase_ms() - last_ms < TICK_MS) return;
+  last_ms += TICK_MS;
+  if (timebase_ms() - last_ms >= TICK_MS) last_ms = timebase_ms();    /* fell behind: do not burst */
+  ticks++;
 
-    if (ticks % (500 / TICK_MS) == 0) led_toggle(LED_HB);       /* 1 Hz blink = firmware alive */
+  if (ticks % (500 / TICK_MS) == 0) led_toggle(LED_HB);         /* 1 Hz blink = firmware alive */
 
-    /* Fault LED: solid while nothing is being logged. (Chapter 6 adds the blink codes.) */
-    logger_get_stats(&lg);
-    led_set(LED_FAULT, lg.state == LOGGER_FAULT || lg.state == LOGGER_CARD_FULL);
+  /* Fault LED: solid while nothing is being logged. (Chapter 6 adds the blink codes.) */
+  logger_get_stats(&lg);
+  led_set(LED_FAULT, lg.state == LOGGER_FAULT || lg.state == LOGGER_CARD_FULL);
 
-    if (ticks % (STATS_PRINT_MS / TICK_MS) == 0) print_stats();
+  if (ticks % (STATS_PRINT_MS / TICK_MS) == 0) print_stats();
 
-    wdg_checkin(WDG_STATUS);
-    if ((__atomic_load_n(&checkins, __ATOMIC_RELAXED) & WDG_ALL) == WDG_ALL) {
-      __atomic_store_n(&checkins, 0, __ATOMIC_RELAXED);
-      board_watchdog_kick();
-    }
+  if (checked_in) {
+    checked_in = 0;
+    board_watchdog_kick();
   }
 }

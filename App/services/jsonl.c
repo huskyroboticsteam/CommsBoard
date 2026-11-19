@@ -130,6 +130,7 @@ size_t jsonl_format_header(char *out, size_t cap, const jsonl_hdr_t *h)
   p = put_str(p, "\",\"rtc\":");                p = put_u32(p, h->rtc);
   p = put_str(p, ",\"rtc_ok\":");               p = put_str(p, h->rtc_ok ? "true" : "false");
   p = put_str(p, ",\"bitrate\":");              p = put_u32(p, h->bitrate);
+  if (h->loopback) p = put_str(p, ",\"loopback\":true");
   *p++ = '}';
   *p++ = '\n';
   return (size_t)(p - out);

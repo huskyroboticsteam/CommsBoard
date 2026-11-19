@@ -1,10 +1,13 @@
 /**
-  * logger.c - the only task that touches FatFs and the SD card.
+  * logger.c - the only code that touches FatFs and the SD card.
   *
-  * It takes binary records from the log ring, formats each as one JSON line, packs
-  * whole lines into 512-byte blocks in a staging buffer, and writes the buffer when
-  * it is full or once a second. While the card is missing, slow or broken this task
-  * may block - CAN handling does not: the ring fills, and can_task drops and counts.
+  * Each call to logger_poll() does one step: it takes binary records from the log ring,
+  * formats each as one JSON line, packs whole lines into 512-byte blocks in a staging
+  * buffer, and writes the buffer when it is full or once a second.
+  *
+  * A card write can take a long time. While the SD driver waits on the card it calls
+  * app_yield(), which keeps CAN routing running. If the card is missing, slow or broken,
+  * the ring fills, and can_task drops and counts.
   *
   *   INIT ----> OPEN ----> LOGGING --(part full)--> OPEN
   *     |          |           |
@@ -22,7 +25,6 @@
 #include "storage.h"
 #include "timebase.h"
 #include "timekeeping.h"
-#include "cmsis_os.h"
 #include <string.h>
 
 #if __has_include("version.h")
@@ -32,12 +34,7 @@
 #define FW_GIT_HASH "unknown"
 #endif
 
-#define FLAG_RECORDS    0x1u    /* can_task: records are waiting */
-#define FLAG_SD_DONE    0x2u    /* SD driver: a DMA transfer finished */
-#define IDLE_WAIT_MS    100
 #define RETRY_DELAY_MS  200     /* between card start-up tries */
-
-extern osThreadId_t loggerTaskHandle;
 
 static char stage_buf[JSON_STAGING_BYTES];
 static jsonl_stage_t stage;
@@ -47,17 +44,13 @@ static uint64_t part_bytes;     /* written to the current part, header included 
 static uint32_t last_flush_ms;
 static uint32_t boot_rtc;       /* RTC time when this boot started logging */
 static int boot_rtc_ok;
-static int recovering;         /* the next part opens after a card fault */
+static int recovering;          /* the next part opens after a card fault */
+static int init_tries;          /* failed card start-ups in a row */
+static uint32_t wait_start_ms;  /* when the current retry delay or fault began */
 
 /* ---- hooks the SD driver calls ---- */
-static void sd_wait(uint32_t timeout_ms) { osThreadFlagsWait(FLAG_SD_DONE, osFlagsWaitAny, timeout_ms); }
-static void sd_wake_isr(void)            { osThreadFlagsSet(loggerTaskHandle, FLAG_SD_DONE); }
-static void sd_progress(void)            { wdg_checkin(WDG_LOGGER); }   /* the card answered: we are alive */
-
-void logger_wake(void)
-{
-  osThreadFlagsSet(loggerTaskHandle, FLAG_RECORDS);
-}
+static void sd_wait(uint32_t timeout_ms) { (void)timeout_ms; app_yield(); }   /* waiting on the card: keep CAN going */
+static void sd_progress(void)            { wdg_checkin(); }                   /* the card answered: we are alive */
 
 void logger_get_stats(logger_stats_t *out)
 {
@@ -71,15 +64,15 @@ static void enter_fault(void)
   stats.state = LOGGER_FAULT;
   stats.faults++;
   recovering = 1;
+  wait_start_ms = timebase_ms();
 }
 
 /* Write the staged blocks to the card. Returns 0 on success. */
 static int flush(void)
 {
-  uint32_t t0 = osKernelGetTickCount();
   int res;
 
-  last_flush_ms = t0;
+  last_flush_ms = timebase_ms();
   if (stage.len == 0) return 0;
   jsonl_stage_pad(&stage);
   led_set(LED_SD, 1);
@@ -116,15 +109,15 @@ static int put_sys(uint8_t event)
 /* INIT: start the card, mount it, work out the boot ID and check free space. */
 static void do_init(void)
 {
-  static int tries;
   uint32_t free_mb, card_max, id;
 
+  if (init_tries && timebase_ms() - wait_start_ms < RETRY_DELAY_MS) return;   /* between tries */
   if (storage_mount(&free_mb, &card_max) != 0) {
-    if (++tries >= SD_MAX_RECOVERIES) { tries = 0; enter_fault(); }
-    else osDelay(RETRY_DELAY_MS);
+    wait_start_ms = timebase_ms();
+    if (++init_tries >= SD_MAX_RECOVERIES) { init_tries = 0; enter_fault(); }
     return;
   }
-  tries = 0;
+  init_tries = 0;
 
   if (stats.boot_id == 0) {
     /* Once per boot: 1 + the larger of the backup register and the highest ID on the
@@ -143,19 +136,24 @@ static void do_init(void)
 static void do_open(void)
 {
   jsonl_hdr_t hdr = { FW_GIT_HASH, BOARD_NAME, stats.boot_id, board_reset_cause(),
-                      boot_rtc, boot_rtc_ok, CAN_BITRATE_BPS };
+                      boot_rtc, boot_rtc_ok, CAN_BITRATE_BPS, CAN_LOOPBACK };
 
   stage.len = jsonl_format_header(stage.buf, stage.cap, &hdr);
   jsonl_stage_pad(&stage);
-  if (stats.part >= 99 || storage_open_part(stats.boot_id, stats.part + 1, LOG_PREALLOC_MB, stage.buf) != 0) {
+  if (stats.part >= 99) {                   /* file names only have two digits for the part */
+    stage.len = 0;
+    stats.state = LOGGER_CARD_FULL;         /* stop here; retrying could never succeed */
+    return;
+  }
+  stats.part++;                             /* used up even if the open fails: a retry never reuses a name */
+  if (storage_open_part(stats.boot_id, stats.part, LOG_PREALLOC_MB, stage.buf) != 0) {
     enter_fault();
     return;
   }
-  stats.part++;
   stats.bytes += stage.len;
   part_bytes = stage.len;
   stage.len = 0;
-  last_flush_ms = osKernelGetTickCount();
+  last_flush_ms = timebase_ms();
   stats.state = LOGGER_LOGGING;
   if (put_sys(recovering ? LOGREC_EV_RECOVER : LOGREC_EV_START) != 0) enter_fault();
   else recovering = 0;
@@ -184,43 +182,35 @@ static void do_logging(void)
       return;
     }
   }
-  if (osKernelGetTickCount() - last_flush_ms >= LOG_FLUSH_INTERVAL_MS && flush() != 0) enter_fault();
+  if (timebase_ms() - last_flush_ms >= LOG_FLUSH_INTERVAL_MS && flush() != 0) enter_fault();
 }
 
-void logger_task(void *argument)
+void logger_init(void)
 {
-  static const SD_Hooks hooks = { sd_wait, sd_wake_isr, sd_progress };
-  uint32_t fault_ms = 0;
+  static const SD_Hooks hooks = { sd_wait, sd_progress };
 
-  (void)argument;
   SD_SetHooks(&hooks);
   jsonl_stage_init(&stage, stage_buf, sizeof stage_buf);
   stats.state = LOGGER_INIT;
+}
 
-  for (;;) {
-    wdg_checkin(WDG_LOGGER);
-    switch (stats.state) {
-    case LOGGER_INIT:
-      do_init();
-      if (stats.state == LOGGER_FAULT) fault_ms = osKernelGetTickCount();
-      break;
-    case LOGGER_OPEN:
-      do_open();
-      if (stats.state == LOGGER_FAULT) fault_ms = osKernelGetTickCount();
-      break;
-    case LOGGER_LOGGING:
-      osThreadFlagsWait(FLAG_RECORDS, osFlagsWaitAny, IDLE_WAIT_MS);
-      do_logging();
-      if (stats.state == LOGGER_FAULT) fault_ms = osKernelGetTickCount();
-      break;
-    case LOGGER_FAULT:
-      /* Nothing is read from the ring, so it fills and can_task counts what is lost. */
-      osDelay(IDLE_WAIT_MS);
-      if (osKernelGetTickCount() - fault_ms >= SD_FAULT_RETRY_MS) stats.state = LOGGER_INIT;
-      break;
-    case LOGGER_CARD_FULL:
-      osDelay(IDLE_WAIT_MS);    /* stays here: old files are never deleted automatically */
-      break;
-    }
+void logger_poll(void)
+{
+  switch (stats.state) {
+  case LOGGER_INIT:
+    do_init();
+    break;
+  case LOGGER_OPEN:
+    do_open();
+    break;
+  case LOGGER_LOGGING:
+    do_logging();
+    break;
+  case LOGGER_FAULT:
+    /* Nothing is read from the ring, so it fills and can_task counts what is lost. */
+    if (timebase_ms() - wait_start_ms >= SD_FAULT_RETRY_MS) stats.state = LOGGER_INIT;
+    break;
+  case LOGGER_CARD_FULL:
+    break;                      /* stays here: old files are never deleted automatically */
   }
 }

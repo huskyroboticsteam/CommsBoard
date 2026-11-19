@@ -36,4 +36,9 @@ void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state);
 uint32_t HAL_GetTick(void);
 uint32_t HAL_RCC_GetPCLK2Freq(void);
 
+/* Interrupt masking (board.h): nothing to mask on a PC. */
+static inline uint32_t __get_PRIMASK(void) { return 0; }
+static inline void __set_PRIMASK(uint32_t primask) { (void)primask; }
+static inline void __disable_irq(void) { }
+
 #endif

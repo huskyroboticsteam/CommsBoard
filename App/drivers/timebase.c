@@ -15,9 +15,15 @@ void timebase_init(void)
   HAL_TIM_Base_Start_IT(&BOARD_US_TIMER_HANDLE);
 }
 
-void timebase_on_overflow(void)
+/* TIM2 wrapped (every 71.6 minutes). HAL calls this from the TIM2 interrupt. */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  overflows++;
+  if (htim == &BOARD_US_TIMER_HANDLE) overflows++;
+}
+
+uint32_t timebase_ms(void)
+{
+  return HAL_GetTick();
 }
 
 uint32_t timebase_now_lo(void)

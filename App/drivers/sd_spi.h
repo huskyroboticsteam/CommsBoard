@@ -24,13 +24,13 @@ typedef struct {
   uint32_t errors;        /* failed reads + writes */
 } SD_Stats;
 
-/* Optional hooks from whichever task owns the card. Without them the driver busy-waits.
- *  wait(ms)   - sleep until wake_isr() is called or ms have passed
- *  wake_isr() - called from the DMA interrupt when a transfer finishes
+/* Optional hooks from the code that owns the card. Without them the driver just spins.
+ *  wait(ms)   - called over and over while the driver waits on the card (a busy card,
+ *               or a DMA transfer in flight). Do other work here and return soon;
+ *               ms is how much longer the driver is prepared to wait.
  *  progress() - called whenever the card answers (lets a watchdog see we are alive) */
 typedef struct {
   void (*wait)(uint32_t timeout_ms);
-  void (*wake_isr)(void);
   void (*progress)(void);
 } SD_Hooks;
 

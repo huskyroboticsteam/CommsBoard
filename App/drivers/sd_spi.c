@@ -36,7 +36,7 @@
 
 #define SPI_TIMEOUT_MS    100   /* one SPI transfer */
 #define READ_TOKEN_MS     200   /* card must start sending read data within this */
-#define SPIN_BEFORE_SLEEP_US 2000  /* busy-poll this long, then sleep between polls */
+#define SPIN_BEFORE_YIELD_US 2000  /* poll flat out this long, then let other work run between polls */
 
 enum { DMA_IDLE = 0, DMA_BUSY, DMA_DONE, DMA_ERROR };
 
@@ -76,8 +76,8 @@ static uint8_t xchg(uint8_t out)
 }
 
 /* Wait until the card stops holding MISO low (busy). 1 = ready, 0 = timed out.
- * Polls flat out at first (the usual wait is short), then sleeps between polls so a
- * long card stall does not starve lower-priority tasks. */
+ * Polls flat out at first (the usual wait is short), then calls the wait hook between
+ * polls so a long card stall does not hold up the rest of the firmware. */
 static int wait_ready(uint32_t timeout_ms)
 {
   uint32_t start_ms = HAL_GetTick();
@@ -85,7 +85,7 @@ static int wait_ready(uint32_t timeout_ms)
 
   do {
     if (xchg(0xFF) == 0xFF) return 1;
-    if (hooks.wait && timebase_now_lo() - start_us > SPIN_BEFORE_SLEEP_US) hooks.wait(1);
+    if (hooks.wait && timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) hooks.wait(timeout_ms);
   } while (HAL_GetTick() - start_ms < timeout_ms);
   return 0;
 }
@@ -141,7 +141,8 @@ static uint8_t send_cmd(uint8_t cmd, uint32_t arg)
 
 /* ---- 512-byte data transfers: DMA when possible, polling otherwise ---- */
 
-/* DMA cannot reach the CCM SRAM, and before the hooks exist there is nothing to wake. */
+/* DMA cannot reach the CCM SRAM. Without a wait hook there is nothing useful to do
+ * while a DMA transfer runs, so plain polling is just as good. */
 static int can_dma(const void *buf, uint32_t len)
 {
   uintptr_t a = (uintptr_t)buf;
@@ -157,7 +158,7 @@ static int dma_wait(void)
       HAL_SPI_Abort(&hspi);
       return 0;
     }
-    hooks.wait(SPI_TIMEOUT_MS);   /* the DMA-complete interrupt wakes us */
+    hooks.wait(SPI_TIMEOUT_MS);   /* other work runs while the DMA moves the block */
   }
   return dma_state == DMA_DONE;
 }
@@ -166,7 +167,6 @@ static void dma_finished(SPI_HandleTypeDef *h, uint8_t state)
 {
   if (h != &hspi) return;
   dma_state = state;
-  if (hooks.wake_isr) hooks.wake_isr();
 }
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h) { dma_finished(h, DMA_DONE); }

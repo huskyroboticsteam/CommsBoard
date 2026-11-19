@@ -1,5 +1,5 @@
 /**
-  * timebase.h - the two clocks:
+  * timebase.h - the clocks:
   *  - a microsecond clock: TIM2 free-running at 1 MHz, extended to 64 bits;
   *  - the RTC (wall-clock time), plus the backup registers that survive a reset.
   *
@@ -11,9 +11,9 @@
 #include <stdint.h>
 
 void timebase_init(void);            /* start TIM2 */
-uint64_t timebase_now_us(void);      /* microseconds since boot; safe in tasks and interrupts */
+uint64_t timebase_now_us(void);      /* microseconds since boot; safe in the main loop and interrupts */
 uint32_t timebase_now_lo(void);      /* low 32 bits only: one register read, for interrupts */
-void timebase_on_overflow(void);     /* call from the TIM2 period-elapsed callback */
+uint32_t timebase_ms(void);          /* milliseconds since boot (wraps after 49 days): for timeouts */
 
 /* Calendar time as the RTC holds it (UTC, years 2000-2099). */
 typedef struct { uint16_t year; uint8_t month, day, hour, minute, second; } rtc_civil_t;

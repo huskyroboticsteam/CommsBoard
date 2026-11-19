@@ -23,7 +23,8 @@ static uint32_t boot_id_of(const char *name)
   return (name[6] == '_') ? id : 0;
 }
 
-/* Builds "LOG/B00042_01.jsonl" without printf. */
+/* Builds "LOG/B00042_01.jsonl" without printf. Only five digits of the boot ID fit, so
+ * after 99,999 boots names repeat; storage_open_part() refuses to overwrite a file. */
 static void part_path(char *out, uint32_t boot_id, uint32_t part)
 {
   static const char prefix[] = LOG_DIR "/B";
@@ -76,7 +77,7 @@ int storage_open_part(uint32_t boot_id, uint32_t part, uint32_t prealloc_mb, con
 
   storage_close();
   part_path(path, boot_id, part);
-  if (f_open(&USERFile, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -1;
+  if (f_open(&USERFile, path, FA_CREATE_NEW | FA_WRITE) != FR_OK) return -1;    /* never overwrite a log */
   file_open = 1;
   /* Reserve the whole file now, in one contiguous run (fails if there is no such run).
    * After this, writing data never touches the FAT or the directory entry. */

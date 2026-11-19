@@ -24,6 +24,7 @@ typedef struct {
   uint32_t rtc;           /* RTC Unix seconds at boot */
   int rtc_ok;             /* is the RTC time valid? */
   uint32_t bitrate;       /* CAN bit rate */
+  int loopback;           /* CAN was in internal loopback: every tx frame also shows up as rx */
 } jsonl_hdr_t;
 
 /* Format one record as a JSON line ending in '\n'. out must hold JSONL_MAX_LINE bytes.

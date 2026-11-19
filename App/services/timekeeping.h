@@ -9,7 +9,8 @@
 #include "timebase.h"
 
 /* Rebuild a full 64-bit microsecond time from a record's low 32 bits.
- * now_us is the current 64-bit time; the record must be less than ~71 minutes old. */
+ * now_us is roughly the current 64-bit time; the record may be up to ~35 minutes
+ * older or newer than it. */
 uint64_t tk_extend_us(uint64_t now_us, uint32_t t_lo);
 
 /* Calendar date/time (UTC) <-> Unix seconds, valid for years 2000-2099 (the RTC's range). */

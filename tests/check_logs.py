@@ -63,7 +63,15 @@ def part(name):
     assert recs and recs[0]["k"] == "hdr", (name, reason)
     # The unused, preallocated tail is zeros on a blank card (skipped) or old data (stops the read).
     assert reason == "end of file" or "not valid JSON" in reason, (name, reason)
+    check_frame_times(name, recs[1:])
     return recs[0], recs[1:]
+
+
+def check_frame_times(name, recs):
+    """Frames are stamped in the order they enter the ring, so their times never go backwards."""
+    frames = [r for r in recs if r["k"] in ("rx", "tx")]
+    for a, b in zip(frames, frames[1:]):
+        assert a["t"] <= b["t"], f"{name}: time jumps back from {a['t']} to {b['t']} at n={b['n']}"
 
 
 def frame_counters(recs):
@@ -74,9 +82,9 @@ def frame_counters(recs):
 # Boot 1: one part, every record there once and in order.
 hdr, recs = part("B00001_01.jsonl")
 assert hdr["b"] == 1 and hdr["board"] == "NUCLEO" and hdr["reset"] == "POR" and hdr["rtc_ok"] is False and hdr["v"] == 1
+assert hdr["loopback"] is True      # the Nucleo build runs CAN in loopback, and the header says so
 assert len(recs) == 20001 and recs[0]["k"] == "sys" and recs[0]["ev"] == "start"
 assert [r["n"] for r in recs] == list(range(20001))
-assert all(a["t"] <= b["t"] for a, b in zip(recs, recs[1:])), "times must never go backwards"
 # dlc cycles 0..8; only frames with 4+ data bytes carry the whole counter
 assert frame_counters(recs) == [i for i in range(20000) if i % 9 >= 4]
 

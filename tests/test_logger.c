@@ -1,8 +1,9 @@
 /* Host integration test: the real logger.c, storage.c, sd_spi.c, FatFs and its glue,
  * running on a PC against a byte-level SD card emulator.
  *
- * Each "boot" runs logger_task() in a forked child (fresh static state, like a reset)
- * while the test plays the part of can_task and feeds records into the log ring. The
+ * Each "boot" runs the main loop's logger_poll() in a forked child (fresh static state,
+ * like a reset) while the test plays the part of can_task and feeds records into the
+ * log ring. The
  * card image is shared memory, so it survives from one boot to the next. Afterwards the
  * log files are copied off the card into out/card/ for check_logs.py and logread.py.
  */
@@ -18,7 +19,6 @@
 #include "board.h"
 #include "config.h"
 #include "app_fatfs.h"
-#include "cmsis_os.h"
 #include "sd_spi.h"
 #include "spi.h"
 #include "storage.h"
@@ -30,12 +30,11 @@
 GPIO_TypeDef fake_gpioa, fake_gpioc;
 static SPI_TypeDef spi_regs;
 SPI_HandleTypeDef hspi1 = { &spi_regs, { 0 } };
-osThreadId_t loggerTaskHandle;
 
 static uint32_t tick_ms;
 static uint64_t clock_us;
 uint32_t HAL_GetTick(void) { return tick_ms++; }
-uint32_t osKernelGetTickCount(void) { return tick_ms; }
+uint32_t timebase_ms(void) { return tick_ms; }
 uint32_t HAL_RCC_GetPCLK2Freq(void) { return 85000000; }
 uint64_t timebase_now_us(void)
 {
@@ -52,8 +51,8 @@ uint32_t timebase_boot_id_get(void) { return boot_id_reg; }
 void timebase_boot_id_set(uint32_t id) { boot_id_reg = id; }
 void led_set(led_t led, int on) { (void)led; (void)on; }
 const char *board_reset_cause(void) { return "POR"; }
-void wdg_checkin(uint32_t bit) { (void)bit; }
-uint32_t osThreadFlagsSet(osThreadId_t t, uint32_t flags) { (void)t; return flags; }
+void wdg_checkin(void) { }
+void app_yield(void) { }                /* the SD driver's "do other work while waiting" hook */
 
 static log_rec_t log_store[LOG_RING_RECORDS];
 ringbuf_t log_ring;
@@ -146,8 +145,17 @@ void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state)
 }
 HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *h, uint8_t *tx, uint8_t *rx, uint16_t n, uint32_t t)
 { (void)h; (void)t; for (int i = 0; i < n; i++) rx[i] = card_byte(tx[i]); return HAL_OK; }
+static void feed(int max);
 HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *h, uint8_t *tx, uint16_t n, uint32_t t)
-{ (void)h; (void)t; for (int i = 0; i < n; i++) card_byte(tx[i]); return HAL_OK; }
+{
+  (void)h; (void)t;
+  for (int i = 0; i < n; i++) card_byte(tx[i]);
+  /* CAN routing keeps running while the card is busy, so frames keep arriving while a
+   * block is being written: the ring holds records stamped after the logger last read
+   * the clock. */
+  if (n == 512) feed(3);
+  return HAL_OK;
+}
 /* On a PC no buffer address is in the STM32's DMA-reachable range, so these are never used. */
 HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef *h, uint8_t *tx, uint8_t *rx, uint16_t n)
 { (void)h; (void)tx; (void)rx; (void)n; return HAL_ERROR; }
@@ -155,18 +163,31 @@ HAL_StatusTypeDef HAL_SPI_Transmit_DMA(SPI_HandleTypeDef *h, uint8_t *tx, uint16
 { (void)h; (void)tx; (void)n; return HAL_ERROR; }
 HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h) { (void)h; return HAL_OK; }
 
-/* ---------------- playing can_task: feed the ring whenever the logger sleeps ---------------- */
+/* ---------------- playing can_task: feed the ring between logger steps ---------------- */
 typedef struct { logger_stats_t stats; uint32_t produced; } result_t;
 static result_t *result;               /* shared with the parent */
 static uint32_t target, produced;
 static int inject_fault, fault_seen, idle_rounds;
 
-static void logger_sleeps(uint32_t ms)
+/* Push up to max records into the ring, stamped with the current time. */
+static void feed(int max)
 {
-  logger_stats_t st;
   log_rec_t rec;
   uint8_t data[8];
-  int fed = 0;
+
+  while (produced < target && max-- > 0) {
+    memcpy(data, &produced, 4); memcpy(data + 4, "\x55\xAA\x55\xAA", 4);
+    logrec_frame(&rec, produced % 4 ? LOGREC_RX : LOGREC_TX, timebase_now_lo(),
+                 (uint16_t)(0x100 + produced % 256), (uint8_t)(produced % 9), 0, data);
+    if (!ringbuf_push(&log_ring, &rec)) break;        /* full: wait (a real can_task would drop) */
+    produced++;
+  }
+}
+
+/* One main-loop pass apart from the logger: time moves on and frames arrive. */
+static void other_jobs(uint32_t ms)
+{
+  logger_stats_t st;
 
   tick_ms += ms;
   logger_get_stats(&st);
@@ -176,13 +197,7 @@ static void logger_sleeps(uint32_t ms)
   if (inject_fault && !fault_seen && produced >= target / 2) reject_writes = 1;
   if (st.state == LOGGER_FAULT) { fault_seen = 1; reject_writes = 0; }
 
-  while (produced < target && fed++ < 2000) {
-    memcpy(data, &produced, 4); memcpy(data + 4, "\x55\xAA\x55\xAA", 4);
-    logrec_frame(&rec, produced % 4 ? LOGREC_RX : LOGREC_TX, timebase_now_lo(),
-                 (uint16_t)(0x100 + produced % 256), (uint8_t)(produced % 9), 0, data);
-    if (!ringbuf_push(&log_ring, &rec)) break;        /* full: wait (a real can_task would drop) */
-    produced++;
-  }
+  feed(2000);
 
   /* Done once everything is fed, drained, and the once-a-second flush has had time to run. */
   if (st.state == LOGGER_CARD_FULL || (produced == target && ringbuf_count(&log_ring) == 0)) {
@@ -196,14 +211,6 @@ static void logger_sleeps(uint32_t ms)
   }
 }
 
-uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout_ms)
-{
-  (void)options; (void)timeout_ms;
-  if (flags == 0x1u) logger_sleeps(20);               /* the logger's "wait for records" */
-  return flags;
-}
-int osDelay(uint32_t ms) { logger_sleeps(ms); return 0; }
-
 /* One boot: run the logger in a child until the scenario finishes; return its final stats. */
 static result_t boot(uint32_t records, int with_fault)
 {
@@ -215,8 +222,11 @@ static result_t boot(uint32_t records, int with_fault)
     target = records;
     inject_fault = with_fault;
     ringbuf_init(&log_ring, log_store, LOG_RING_RECORDS);
-    logger_task(NULL);                                /* never returns: logger_sleeps() exits */
-    _exit(1);
+    logger_init();
+    for (;;) {                                        /* the main loop; other_jobs() exits when done */
+      other_jobs(20);
+      logger_poll();
+    }
   }
   assert(waitpid(pid, &status, 0) == pid);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

@@ -31,7 +31,7 @@ void dbg_write(const char *text, size_t len)
   uint32_t primask = __get_PRIMASK();
   size_t i;
 
-  __disable_irq();                  /* callers are several tasks; keep this short */
+  __disable_irq();                  /* the DMA-complete interrupt uses these too; keep this short */
   for (i = 0; i < len; i++) {
     uint16_t next = (uint16_t)((head + 1) % DBG_BUF_SIZE);
     if (next == tail) break;        /* full: drop the rest */

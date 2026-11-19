@@ -2,7 +2,7 @@
   * ringbuf.h - fixed-size ring of log records for exactly ONE writer and ONE reader.
   *
   * The writer only changes head and the reader only changes tail, so no lock is
-  * needed between an interrupt and a task (or between two tasks). One slot always
+  * needed between an interrupt and the main loop. One slot always
   * stays empty, so a ring made with cap slots holds cap - 1 records.
   * No HAL here: this compiles and runs in the PC unit tests.
   */

@@ -9,7 +9,11 @@
 
 /* ---- CAN ---- */
 #define CAN_BITRATE_BPS           1000000   /* confirm against CAN26 */
-#define CAN_LOOPBACK              1         /* 1 = internal loopback (no transceiver), 0 = real bus */
+#ifdef BOARD_NUCLEO
+#define CAN_LOOPBACK              1         /* internal loopback: no transceiver or second node needed */
+#else
+#define CAN_LOOPBACK              0         /* the real bus. Never loopback on the rover: nothing would reach it */
+#endif
 #define CAN_TX_QUEUE_LEN          32
 #define CAN_RX_RING_FRAMES        512
 #define CAN_BUSOFF_RESTART_MS     100

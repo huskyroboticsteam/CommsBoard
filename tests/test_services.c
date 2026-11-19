@@ -96,9 +96,15 @@ static void test_jsonl_format(void)
   const uint8_t one[1] = { 0x01 };
   const uint8_t full[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
   char hdr[512];
-  jsonl_hdr_t h = { "a1b2c3d", "NUCLEO", 42, "POR", 1762909680u, 1, 1000000 };
+  jsonl_hdr_t h = { "a1b2c3d", "NUCLEO", 42, "POR", 1762909680u, 1, 1000000, 0 };
+  jsonl_hdr_t lb = { "a1b2c3d", "NUCLEO", 7, "IWDG", 0, 0, 500000, 1 };
   log_rec_t r;
   size_t len;
+
+  len = jsonl_format_header(hdr, sizeof hdr, &lb);    /* loopback is called out in the header */
+  hdr[len - 1] = 0;
+  assert(strcmp(hdr, "{\"k\":\"hdr\",\"v\":1,\"fw\":\"a1b2c3d\",\"board\":\"NUCLEO\",\"b\":7,"
+                     "\"reset\":\"IWDG\",\"rtc\":0,\"rtc_ok\":false,\"bitrate\":500000,\"loopback\":true}") == 0);
 
   /* The example lines from the architecture document, byte for byte. */
   len = jsonl_format_header(hdr, sizeof hdr, &h);
@@ -202,17 +208,21 @@ static void test_timekeeping(void)
   assert(tk_extend_us(0x100000010ull, 0xFFFFFFF0u) == 0xFFFFFFF0ull);
   assert(tk_extend_us(0x300000005ull, 0x00000001u) == 0x300000001ull);
   assert(tk_extend_us(0x300000005ull, 0xFFFFFFFFu) == 0x2FFFFFFFFull);
+  /* A record stamped just AFTER "now" was sampled (frames keep arriving while the logger works) must
+   * come out slightly in the future, not 71 minutes in the past. */
+  assert(tk_extend_us(5000, 5100) == 5100);
+  assert(tk_extend_us(0x1FFFFFFF0ull, 0x00000010u) == 0x200000010ull);   /* newer, across the wrap */
   puts("timekeeping  ok");
 }
 
-/* Write a log file the way logger_task does: header block, then records packed into
+/* Write a log file the way the logger does: header block, then records packed into
  * 512-byte blocks. With torn = 1, the tail simulates a power cut: a half-written block
  * followed by leftover lines from an older boot in the preallocated space. */
 static void write_sample(const char *path, uint32_t boot, uint32_t records, int torn)
 {
   static char buf[4096];
   char line[JSONL_MAX_LINE];
-  jsonl_hdr_t h = { "a1b2c3d", "NUCLEO", boot, "POR", 1762909680u, 1, 1000000 };
+  jsonl_hdr_t h = { "a1b2c3d", "NUCLEO", boot, "POR", 1762909680u, 1, 1000000, 0 };
   jsonl_stage_t s;
   log_rec_t r;
   uint8_t data[8];
