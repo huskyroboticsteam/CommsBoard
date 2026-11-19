@@ -7,8 +7,13 @@
   *  - While the card is busy writing it holds MISO low; 0xFF means "ready".
   */
 #include "sd_spi.h"
+#include "board.h"
+#include "config.h"
 #include "spi.h"
+#include "timebase.h"
 #include <string.h>
+
+#define hspi BOARD_SD_SPI_HANDLE
 
 /* Commands. 0x80 marks an "application" command, which needs CMD55 sent first. */
 #define CMD0    0       /* GO_IDLE_STATE: reset into SPI mode */
@@ -29,32 +34,66 @@
 #define CT_SDC2   0x02  /* SD v2 */
 #define CT_BLOCK  0x04  /* block addressing (SDHC/SDXC) */
 
-#define SD_SPI_TIMEOUT_MS  100
+#define SPI_TIMEOUT_MS    100   /* one SPI transfer */
+#define READ_TOKEN_MS     200   /* card must start sending read data within this */
+#define SPIN_BEFORE_YIELD_US 2000  /* poll flat out this long, then let other work run between polls */
+
+enum { DMA_IDLE = 0, DMA_BUSY, DMA_DONE, DMA_ERROR };
 
 static uint8_t card_type;   /* 0 = not initialized */
+static SD_Hooks hooks;
+static SD_Stats stats;
+static volatile uint8_t dma_state;
 
-static void set_speed(uint32_t prescaler)
+void SD_SetHooks(const SD_Hooks *h)
 {
-  __HAL_SPI_DISABLE(&hspi1);  /* the speed may only change while SPI is off; HAL turns it back on */
-  MODIFY_REG(hspi1.Instance->CR1, SPI_CR1_BR, prescaler);
-  hspi1.Init.BaudRatePrescaler = prescaler;
+  hooks = *h;
+}
+
+const SD_Stats *SD_GetStats(void)
+{
+  return &stats;
+}
+
+/* Pick the fastest SPI clock that does not exceed hz (SPI1 runs from PCLK2). */
+static void set_speed(uint32_t hz)
+{
+  uint32_t pclk = HAL_RCC_GetPCLK2Freq();
+  uint32_t br = 0;                      /* divider = 2 << br */
+
+  while (br < 7 && (pclk >> (br + 1)) > hz) br++;
+  __HAL_SPI_DISABLE(&hspi);             /* the speed may only change while SPI is off; HAL turns it back on */
+  MODIFY_REG(hspi.Instance->CR1, SPI_CR1_BR, br << SPI_CR1_BR_Pos);
+  hspi.Init.BaudRatePrescaler = br << SPI_CR1_BR_Pos;
+}
+
+/* Let the rest of the firmware run for a moment. Every loop that waits on the card
+ * calls this, so a slow or absent card never holds up CAN handling. */
+static void yield(void)
+{
+  if (hooks.wait) hooks.wait();
 }
 
 /* Send one byte and return the byte the card sent back at the same time. */
 static uint8_t xchg(uint8_t out)
 {
   uint8_t in = 0xFF;
-  HAL_SPI_TransmitReceive(&hspi1, &out, &in, 1, SD_SPI_TIMEOUT_MS);
+  HAL_SPI_TransmitReceive(&hspi, &out, &in, 1, SPI_TIMEOUT_MS);
   return in;
 }
 
-/* Wait until the card stops holding MISO low (busy). 1 = ready, 0 = timed out. */
+/* Wait until the card stops holding MISO low (busy). 1 = ready, 0 = timed out.
+ * Polls flat out at first (the usual wait is short), then calls the wait hook between
+ * polls so a long card stall does not hold up the rest of the firmware. */
 static int wait_ready(uint32_t timeout_ms)
 {
-  uint32_t start = HAL_GetTick();
+  uint32_t start_ms = HAL_GetTick();
+  uint32_t start_us = timebase_now_lo();
+
   do {
     if (xchg(0xFF) == 0xFF) return 1;
-  } while (HAL_GetTick() - start < timeout_ms);
+    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield();
+  } while (HAL_GetTick() - start_ms < timeout_ms);
   return 0;
 }
 
@@ -68,7 +107,7 @@ static int cs_select(void)
 {
   HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_RESET);
   xchg(0xFF);
-  if (wait_ready(500)) return 1;
+  if (wait_ready(SD_WRITE_TIMEOUT_MS)) return 1;
   cs_deselect();
   return 0;
 }
@@ -103,26 +142,76 @@ static uint8_t send_cmd(uint8_t cmd, uint32_t arg)
   do {
     res = xchg(0xFF);
   } while ((res & 0x80) && --n);
+  if (res != 0xFF && hooks.progress) hooks.progress();
   return res;
 }
+
+/* ---- 512-byte data transfers: DMA when possible, polling otherwise ---- */
+
+/* Should this block go by DMA? Without a wait hook there is nothing useful to do while
+ * a DMA transfer runs, so plain polling is just as good. DMA also cannot reach the CCM
+ * SRAM: a buffer there still works, by polling, but slower and without yielding, so it
+ * is counted and shows up in the stats line. */
+static int can_dma(const void *buf, uint32_t len)
+{
+  uintptr_t a = (uintptr_t)buf;
+
+  if (len != 512 || !hooks.wait) return 0;
+  if (a >= 0x20000000u && a + len <= BOARD_CCM_START) return 1;
+  stats.polled_blocks++;
+  return 0;
+}
+
+static int dma_wait(void)
+{
+  uint32_t start = HAL_GetTick();
+
+  while (dma_state == DMA_BUSY) {
+    if (HAL_GetTick() - start > SPI_TIMEOUT_MS) {
+      HAL_SPI_Abort(&hspi);
+      return 0;
+    }
+    yield();                      /* other work runs while the DMA moves the block */
+  }
+  return dma_state == DMA_DONE;
+}
+
+static void dma_finished(SPI_HandleTypeDef *h, uint8_t state)
+{
+  if (h != &hspi) return;
+  dma_state = state;
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h) { dma_finished(h, DMA_DONE); }
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *h)   { dma_finished(h, DMA_DONE); }
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)    { dma_finished(h, DMA_ERROR); }
 
 /* Receive a data block of len bytes. 1 = OK. */
 static int rcvr_datablock(uint8_t *buf, uint32_t len)
 {
   uint8_t token;
   uint32_t start = HAL_GetTick();
+  uint32_t start_us = timebase_now_lo();
 
-  do {
+  for (;;) {                    /* the card sends 0xFF until the data is ready */
     token = xchg(0xFF);
-  } while (token == 0xFF && HAL_GetTick() - start < 200);
+    if (token != 0xFF || HAL_GetTick() - start >= READ_TOKEN_MS) break;
+    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield();
+  }
   if (token != 0xFE) return 0;
 
   /* Clock out 0xFF while reading. Same buffer for both is safe: each byte is
    * sent before its reply arrives. */
   memset(buf, 0xFF, len);
-  if (HAL_SPI_TransmitReceive(&hspi1, buf, buf, (uint16_t)len, SD_SPI_TIMEOUT_MS) != HAL_OK) return 0;
+  if (can_dma(buf, len)) {
+    dma_state = DMA_BUSY;
+    if (HAL_SPI_TransmitReceive_DMA(&hspi, buf, buf, (uint16_t)len) != HAL_OK || !dma_wait()) return 0;
+  } else if (HAL_SPI_TransmitReceive(&hspi, buf, buf, (uint16_t)len, SPI_TIMEOUT_MS) != HAL_OK) {
+    return 0;
+  }
   xchg(0xFF);                   /* discard CRC */
   xchg(0xFF);
+  if (hooks.progress) hooks.progress();
   return 1;
 }
 
@@ -131,24 +220,22 @@ static int xmit_datablock(const uint8_t *buf, uint8_t token)
 {
   uint8_t resp;
 
-  if (!wait_ready(500)) return 0;
+  if (!wait_ready(SD_WRITE_TIMEOUT_MS)) return 0;
   xchg(token);
   if (token == 0xFD) return 1;
 
-  if (HAL_SPI_Transmit(&hspi1, (uint8_t *)buf, 512, SD_SPI_TIMEOUT_MS) != HAL_OK) return 0;
+  if (can_dma(buf, 512)) {
+    dma_state = DMA_BUSY;
+    if (HAL_SPI_Transmit_DMA(&hspi, (uint8_t *)buf, 512) != HAL_OK || !dma_wait()) return 0;
+  } else if (HAL_SPI_Transmit(&hspi, (uint8_t *)buf, 512, SPI_TIMEOUT_MS) != HAL_OK) {
+    return 0;
+  }
   xchg(0xFF);                   /* dummy CRC */
   xchg(0xFF);
   resp = xchg(0xFF);            /* data response: xxx00101 = accepted */
-  return (resp & 0x1F) == 0x05;
-}
-
-int SD_IsCardInserted(void)
-{
-#if SD_USE_CARD_DETECT
-  return HAL_GPIO_ReadPin(SD_DETECT_GPIO_Port, SD_DETECT_Pin) == GPIO_PIN_RESET;
-#else
+  if ((resp & 0x1F) != 0x05) return 0;
+  if (hooks.progress) hooks.progress();
   return 1;
-#endif
 }
 
 SD_Result SD_Init(void)
@@ -158,9 +245,7 @@ SD_Result SD_Init(void)
   int i;
 
   card_type = 0;
-  if (!SD_IsCardInserted()) return SD_NO_CARD;
-
-  set_speed(SD_PRESCALER_SLOW);
+  set_speed(SD_SPI_INIT_HZ);
   HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
   for (i = 0; i < 10; i++) xchg(0xFF);  /* 80+ clocks with CS high: wake the card */
 
@@ -169,7 +254,7 @@ SD_Result SD_Init(void)
     if (send_cmd(CMD8, 0x1AA) == 1) {   /* SD v2 */
       for (i = 0; i < 4; i++) ocr[i] = xchg(0xFF);
       if (ocr[2] == 0x01 && ocr[3] == 0xAA) {      /* card works at 3.3 V */
-        while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 1UL << 30)) ;
+        while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 1UL << 30)) yield();   /* can take a second */
         if (HAL_GetTick() - start < 1000 && send_cmd(CMD58, 0) == 0) {
           for (i = 0; i < 4; i++) ocr[i] = xchg(0xFF);
           ty = (ocr[0] & 0x40) ? (CT_SDC2 | CT_BLOCK) : CT_SDC2;
@@ -177,16 +262,17 @@ SD_Result SD_Init(void)
       }
     } else if (send_cmd(ACMD41, 0) <= 1) {          /* SD v1 */
       ty = CT_SDC1;
-      while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 0)) ;
-      if (HAL_GetTick() - start >= 1000 || send_cmd(CMD16, 512) != 0) ty = 0;
+      while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 0)) yield();
+      if (HAL_GetTick() - start >= 1000) ty = 0;
     }
     /* Old MMC cards are not supported. */
+    if (ty && !(ty & CT_BLOCK) && send_cmd(CMD16, 512) != 0) ty = 0;   /* byte-addressed: 512-byte blocks */
   }
   cs_deselect();
 
   if (!ty) return SD_NO_CARD;
   card_type = ty;
-  set_speed(SD_PRESCALER_FAST);
+  set_speed(SD_SPI_FAST_HZ);
   return SD_OK;
 }
 
@@ -208,12 +294,14 @@ SD_Result SD_ReadBlocks(uint8_t *buf, uint32_t sector, uint32_t count)
     if (count == 0) res = SD_OK;
   }
   cs_deselect();
+  if (res != SD_OK) stats.errors++;
   return res;
 }
 
 SD_Result SD_WriteBlocks(const uint8_t *buf, uint32_t sector, uint32_t count)
 {
   SD_Result res = SD_ERROR;
+  uint32_t t0 = timebase_now_lo(), dt;
 
   if (!card_type || count == 0) return SD_ERROR;
   if (!(card_type & CT_BLOCK)) sector *= 512;
@@ -228,7 +316,16 @@ SD_Result SD_WriteBlocks(const uint8_t *buf, uint32_t sector, uint32_t count)
     if (!xmit_datablock(NULL, 0xFD)) count = 1;     /* stop token */
     if (count == 0) res = SD_OK;
   }
+  /* The card is busy until the data is really stored: wait here so the time we
+   * measure, and the result we return, cover the whole write. */
+  if (res == SD_OK && !wait_ready(SD_WRITE_TIMEOUT_MS)) res = SD_TIMEOUT;
   cs_deselect();
+
+  dt = timebase_now_lo() - t0;
+  stats.writes++;
+  stats.write_sum_us += dt;
+  if (dt > stats.write_max_us) stats.write_max_us = dt;
+  if (res != SD_OK) stats.errors++;
   return res;
 }
 
