@@ -69,9 +69,9 @@ static void set_speed(uint32_t hz)
 
 /* Let the rest of the firmware run for a moment. Every loop that waits on the card
  * calls this, so a slow or absent card never holds up CAN handling. */
-static void yield(uint32_t ms_left)
+static void yield(void)
 {
-  if (hooks.wait) hooks.wait(ms_left);
+  if (hooks.wait) hooks.wait();
 }
 
 /* Send one byte and return the byte the card sent back at the same time. */
@@ -92,7 +92,7 @@ static int wait_ready(uint32_t timeout_ms)
 
   do {
     if (xchg(0xFF) == 0xFF) return 1;
-    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield(timeout_ms);
+    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield();
   } while (HAL_GetTick() - start_ms < timeout_ms);
   return 0;
 }
@@ -171,7 +171,7 @@ static int dma_wait(void)
       HAL_SPI_Abort(&hspi);
       return 0;
     }
-    yield(SPI_TIMEOUT_MS);        /* other work runs while the DMA moves the block */
+    yield();                      /* other work runs while the DMA moves the block */
   }
   return dma_state == DMA_DONE;
 }
@@ -196,7 +196,7 @@ static int rcvr_datablock(uint8_t *buf, uint32_t len)
   for (;;) {                    /* the card sends 0xFF until the data is ready */
     token = xchg(0xFF);
     if (token != 0xFF || HAL_GetTick() - start >= READ_TOKEN_MS) break;
-    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield(READ_TOKEN_MS);
+    if (timebase_now_lo() - start_us > SPIN_BEFORE_YIELD_US) yield();
   }
   if (token != 0xFE) return 0;
 
@@ -254,7 +254,7 @@ SD_Result SD_Init(void)
     if (send_cmd(CMD8, 0x1AA) == 1) {   /* SD v2 */
       for (i = 0; i < 4; i++) ocr[i] = xchg(0xFF);
       if (ocr[2] == 0x01 && ocr[3] == 0xAA) {      /* card works at 3.3 V */
-        while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 1UL << 30)) yield(1000);   /* can take a second */
+        while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 1UL << 30)) yield();   /* can take a second */
         if (HAL_GetTick() - start < 1000 && send_cmd(CMD58, 0) == 0) {
           for (i = 0; i < 4; i++) ocr[i] = xchg(0xFF);
           ty = (ocr[0] & 0x40) ? (CT_SDC2 | CT_BLOCK) : CT_SDC2;
@@ -262,7 +262,7 @@ SD_Result SD_Init(void)
       }
     } else if (send_cmd(ACMD41, 0) <= 1) {          /* SD v1 */
       ty = CT_SDC1;
-      while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 0)) yield(1000);
+      while (HAL_GetTick() - start < 1000 && send_cmd(ACMD41, 0)) yield();
       if (HAL_GetTick() - start >= 1000) ty = 0;
     }
     /* Old MMC cards are not supported. */

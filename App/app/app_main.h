@@ -20,9 +20,11 @@ void app_loop(void);        /* one pass of the main loop */
 /* Run the jobs that must not wait for the SD card (CAN routing and status).
  *
  * RULE: this is called from deep inside the SD driver, in the middle of a FatFs call.
- * Nothing it runs may touch FatFs, storage, the SD driver or the logger - FatFs would
- * re-enter itself and corrupt the card. Anything can_task_poll() or status_poll() ever
- * wants written to the card must go through the log ring. */
+ * Nothing it runs may call into FatFs, storage, the SD driver or the logger - FatFs
+ * would re-enter itself and corrupt the card. Anything can_task_poll() or status_poll()
+ * ever wants written to the card must go through the log ring.
+ * The one exception is reading counters: SD_GetStats() and logger_get_stats() only copy
+ * numbers and start nothing, so status_poll() may call them. */
 void app_yield(void);
 
 /* Longest time between two runs of the CAN job since this was last called (us). */

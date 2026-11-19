@@ -257,7 +257,7 @@ static uint32_t pull(const char *name)
 }
 
 static int yields;
-static void count_yield(uint32_t ms_left) { (void)ms_left; yields++; }
+static void count_yield(void) { yields++; }
 
 int main(void)
 {

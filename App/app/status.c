@@ -37,7 +37,7 @@ static void print_stats(void)
   can_stats_t can;
   can_task_stats_t ct;
   logger_stats_t lg;
-  SD_Stats sd = *SD_GetStats();
+  SD_Stats sd = *SD_GetStats();   /* read-only, so allowed here: see the rule on app_yield() */
   uint32_t secs = STATS_PRINT_MS / 1000, writes, avg_us;
   int n;
 

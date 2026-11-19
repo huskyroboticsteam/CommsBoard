@@ -48,9 +48,11 @@ static int recovering;          /* the next part opens after a card fault */
 static int init_tries;          /* failed card start-ups in a row */
 static uint32_t wait_start_ms;  /* when the current retry delay or fault began */
 
-/* ---- hooks the SD driver calls ---- */
-static void sd_wait(uint32_t timeout_ms) { (void)timeout_ms; app_yield(); }   /* waiting on the card: keep CAN going */
-static void sd_progress(void)            { wdg_checkin(); }                   /* the card answered: we are alive */
+/* The SD driver calls this whenever the card answers: we are alive. */
+static void sd_progress(void)
+{
+  wdg_checkin();
+}
 
 void logger_get_stats(logger_stats_t *out)
 {
@@ -187,7 +189,7 @@ static void do_logging(void)
 
 void logger_init(void)
 {
-  static const SD_Hooks hooks = { sd_wait, sd_progress };
+  static const SD_Hooks hooks = { app_yield, sd_progress };   /* while the card is busy, keep CAN going */
 
   SD_SetHooks(&hooks);
   jsonl_stage_init(&stage, stage_buf, sizeof stage_buf);
