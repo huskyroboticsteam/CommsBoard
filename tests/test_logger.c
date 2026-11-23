@@ -64,6 +64,8 @@ static int read_delay;                 /* 0xFF bytes the card sends before read 
 static uint8_t q[2048]; static unsigned qh, qt;      /* bytes the card will send */
 static uint8_t cmd[6]; static int cmdlen;
 static int idle, app, acmd41_calls;
+static int acmd23_calls, acmd23_bad;   /* pre-erase counts announced, and ones the next write did not match */
+static uint32_t acmd23_count;          /* blocks the last ACMD23 announced (0 = none pending) */
 static int wr_mode;                    /* 0 none, 1 single, 2 multi */
 static int wr_cnt; static uint32_t wr_addr; static uint8_t wr_buf[514];
 static int rd_multi; static uint32_t rd_addr;
@@ -88,6 +90,7 @@ static void do_cmd(void)
   if (c == 0)  { assert(cmd[5] == 0x95); idle = 1; acmd41_calls = 0; put(0x01); return; }
   if (c == 8)  { assert(cmd[5] == 0x87); put(0x01); put(0); put(0); put(cmd[3]); put(cmd[4]); return; }
   if (c == 55) { app = 1; put((uint8_t)idle); return; }
+  if (c == 23 && was_app && !idle) { acmd23_calls++; acmd23_count = arg & 0x7FFFFF; put(0); return; }
   if (c == 41 && was_app) { if (++acmd41_calls >= 3) idle = 0; put((uint8_t)idle); return; }
   if (idle)    { put(0x05); return; }                 /* not initialised yet */
   if (c == 58) { put(0); put(0xC0); put(0xFF); put(0x80); put(0); return; }   /* OCR: ready, SDHC */
@@ -107,6 +110,8 @@ static void do_cmd(void)
     return;
   }
   if (c == 12) { rd_multi = 0; qh = qt; put(0xFF); put(0); put(0); put(0); return; }   /* stuff, R1, busy */
+  if (c == 25 && acmd23_count == 0) acmd23_bad++;      /* every multi-block write is announced */
+  if (c == 24 || c == 25) acmd23_count = 0;            /* an announcement covers the next write only */
   if (c == 24 || c == 25) { put(0); wr_mode = c == 24 ? 1 : 2; wr_addr = arg; wr_cnt = -1; return; }
   put(0x04);                                          /* illegal command */
 }
@@ -205,6 +210,7 @@ static void other_jobs(uint32_t ms)
   /* Done once everything is fed, drained, and the once-a-second flush has had time to run. */
   if (st.state == LOGGER_CARD_FULL || (produced == target && ringbuf_count(&log_ring) == 0)) {
     if (++idle_rounds > 80) {
+      assert(acmd23_bad == 0);                        /* every multi-block write was pre-erased */
       result->stats = st;
       result->produced = produced;
       _exit(0);
@@ -215,7 +221,8 @@ static void other_jobs(uint32_t ms)
 }
 
 /* One boot: run the logger in a child until the scenario finishes; return its final stats. */
-static result_t boot(uint32_t records, int with_fault)
+#define STALE_RECORDS 5
+static result_t boot(uint32_t records, int with_fault, int with_stale)
 {
   int status;
   pid_t pid = fork();
@@ -225,6 +232,17 @@ static result_t boot(uint32_t records, int with_fault)
     target = records;
     inject_fault = with_fault;
     ringbuf_init(&log_ring, log_store, LOG_RING_RECORDS);
+    if (with_stale) {
+      /* Two hours after power-up (so times also pass 2^32 us), with records left over
+       * from 31 minutes ago, before the card came up: too old to timestamp, so they must
+       * be thrown away and reported, never written with a wrong time. */
+      log_rec_t rec;
+      tick_ms = 2u * 3600u * 1000u;
+      for (int i = 0; i < STALE_RECORDS; i++) {
+        logrec_time(&rec, timebase_now_lo() - 31u * 60u * 1000000u, 0);
+        assert(ringbuf_push(&log_ring, &rec));
+      }
+    }
     logger_init();
     for (;;) {                                        /* the main loop; other_jobs() exits when done */
       other_jobs(20);
@@ -284,29 +302,32 @@ int main(void)
   assert(SD_ReadBlocks(work, 0, 1) == SD_OK && yields > 0);
   read_delay = 0;
   assert(f_mkfs(USERPath, FM_ANY, 0, work, sizeof work) == FR_OK);
+  assert(acmd23_calls > 0 && acmd23_bad == 0);        /* multi-block writes announce their size */
 
   /* Boot 1: a short session. */
-  r = boot(20000, 0);
+  r = boot(20000, 0, 0);
   assert(r.stats.state == LOGGER_LOGGING && r.stats.boot_id == 1 && r.stats.part == 1);
   assert(r.stats.lines == 20000 + 1 && r.stats.faults == 0);      /* + the "start" line */
 
   /* Boot 2: the boot ID comes from the files on the card (the backup register was lost). */
-  r = boot(1000, 0);
+  r = boot(1000, 0, 0);
   assert(r.stats.boot_id == 2 && r.stats.part == 1 && r.stats.lines == 1001);
 
   /* Boot 3: enough data to fill a part and roll over into the next. */
-  r = boot(260000, 0);
+  r = boot(260000, 0, 0);
   assert(r.stats.boot_id == 3 && r.stats.part == 2 && r.stats.faults == 0);
   assert(r.stats.lines == 260000 + 2);
 
   /* Boot 4: the card rejects writes for a while. The logger goes to FAULT, retries,
-   * and carries on in a new part. Only the staged lines are lost. */
-  r = boot(60000, 1);
+   * and carries on in a new part. Only the staged lines are lost. It also starts two
+   * hours after power-up with stale records waiting (see boot()). */
+  r = boot(60000, 1, 1);
   assert(r.stats.boot_id == 4 && r.stats.faults == 1 && r.stats.part == 2);
+  assert(r.stats.stale_dropped == STALE_RECORDS);
   assert(r.stats.state == LOGGER_LOGGING && r.produced == 60000);
 
   /* Boot 5: under LOG_MIN_FREE_MB left, so logging refuses to start. */
-  r = boot(100, 0);
+  r = boot(100, 0, 0);
   assert(r.stats.state == LOGGER_CARD_FULL && r.stats.boot_id == 5 && r.stats.part == 0);
 
   /* The card must still mount, and every part must be exactly its preallocated size. */
