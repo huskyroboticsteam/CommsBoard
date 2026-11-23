@@ -130,22 +130,40 @@ void can_drv_get_stats(can_stats_t *out)
 
 /* ---- Interrupt side (HAL calls these from FDCAN2_IT0_IRQHandler) ---- */
 
+#define RXE_BYTES  (18u * 4u)   /* RX FIFO element size in the message RAM: 2 header words + 64 data bytes */
+
+/* Drain RX FIFO 0 straight into the RX ring.
+ *
+ * This reads the message RAM directly instead of calling HAL_FDCAN_GetRxMessage(), for
+ * two reasons:
+ *  - Safety. The HAL copies DLCtoBytes[DLC] bytes, up to 64, whatever the frame format.
+ *    A classic frame may legally carry a DLC of 9-15 (it still means 8 bytes), and the
+ *    HAL would then write up to 64 bytes into the caller's buffer. logrec_rx_element()
+ *    never takes more than 8.
+ *  - Speed. Each frame is built once, in its ring slot: no header struct, no staging
+ *    buffer, no extra 16-byte copy. This runs for every frame on the bus.
+ * Only standard IDs reach this FIFO: the global filter rejects extended ones. */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
+  FDCAN_GlobalTypeDef *can = hfdcan->Instance;
   uint32_t t = timebase_now_lo();     /* read the clock first: keeps timestamp jitter small */
-  FDCAN_RxHeaderTypeDef hdr;
-  uint8_t data[8];
-  log_rec_t rec;
+  uint32_t status, get;
+  log_rec_t *rec;
 
   /* The hardware FIFO overflowed. It reports the event, not how many frames went. */
   if (RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) rx_dropped++;
 
-  while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0) {
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &hdr, data) != HAL_OK) break;
-    logrec_frame(&rec, LOGREC_RX, t, (uint16_t)hdr.Identifier, (uint8_t)hdr.DataLength,
-                 hdr.RxFrameType == FDCAN_REMOTE_FRAME, data);
-    if (ringbuf_push(&rx_ring, &rec)) rx_frames++;
-    else rx_dropped++;                /* ring full: count it, never wait */
+  while ((status = can->RXF0S) & FDCAN_RXF0S_F0FL) {
+    get = (status & FDCAN_RXF0S_F0GI) >> FDCAN_RXF0S_F0GI_Pos;
+    rec = ringbuf_slot(&rx_ring);
+    if (rec) {
+      logrec_rx_element(rec, t, (const volatile uint32_t *)(hfdcan->msgRam.RxFIFO0SA + get * RXE_BYTES));
+      ringbuf_commit(&rx_ring);
+      rx_frames++;
+    } else {
+      rx_dropped++;                   /* ring full: count it, never wait */
+    }
+    can->RXF0A = get;                 /* release the element, stored or not */
   }
 }
 
