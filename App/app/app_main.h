@@ -65,6 +65,7 @@ typedef struct {
   uint32_t lines;           /* JSON lines formatted this boot */
   uint64_t bytes;           /* bytes written to the card this boot */
   uint32_t faults;          /* times the logger entered FAULT */
+  uint32_t stale_dropped;   /* records thrown away unwritten because they waited too long (no card) */
 } logger_stats_t;
 
 void logger_init(void);
