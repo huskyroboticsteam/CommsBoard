@@ -52,7 +52,58 @@ static void test_ringbuf(void)
   }
   while (ringbuf_pop(&r, &out)) { assert(out.t_us == next_out); next_out++; }
   assert(next_in == next_out && next_in > 10000);
+
+  /* Zero-copy API: nothing is visible until commit; peek does not remove. */
+  ringbuf_init(&r, store, 8);
+  assert(!ringbuf_peek(&r));
+  ringbuf_drop(&r);                         /* dropping from an empty ring is harmless */
+  assert(ringbuf_count(&r) == 0);
+  for (i = 0; i < 7; i++) {
+    log_rec_t *slot = ringbuf_slot(&r);
+    assert(slot);
+    logrec_drop(slot, 100 + i, i);
+    assert(ringbuf_count(&r) == i);         /* filled but not yet committed: invisible */
+    ringbuf_commit(&r);
+  }
+  assert(!ringbuf_slot(&r) && r.high_water == 7);   /* full: no slot */
+  for (i = 0; i < 7; i++) {
+    const log_rec_t *p = ringbuf_peek(&r);
+    assert(p && p->t_us == 100 + i && ringbuf_peek(&r) == p);
+    ringbuf_drop(&r);
+  }
+  assert(!ringbuf_peek(&r) && ringbuf_slot(&r));
   puts("ringbuf      ok");
+}
+
+static void test_rx_element(void)
+{
+  /* An RX FIFO element as the FDCAN stores it: ID 0x408, DLC in word 1, data in words 2-3. */
+  uint32_t e[18];
+  log_rec_t r;
+  int i;
+
+  memset(e, 0xEE, sizeof e);                  /* the rest of a 64-byte payload area: must never be read into r */
+  e[0] = 0x408u << 18;
+  e[1] = 3u << 16 | 0xBEEF;                   /* DLC 3, and a hardware timestamp that is ignored */
+  e[2] = 0x04030201u;  e[3] = 0x08070605u;
+  memset(&r, 0xAA, sizeof r);
+  logrec_rx_element(&r, 1234, e);
+  assert(r.t_us == 1234 && r.id == 0x408 && r.dlc == 3 && r.type == LOGREC_RX);
+  assert(r.data[0] == 1 && r.data[1] == 2 && r.data[2] == 3);
+  for (i = 3; i < 8; i++) assert(r.data[i] == 0);
+
+  /* DLC 15 on a classic frame: legal, means 8 bytes. Exactly 8 come across. */
+  e[1] = 15u << 16;
+  logrec_rx_element(&r, 1, e);
+  assert(r.dlc == 8 && r.data[0] == 1 && r.data[7] == 8);
+
+  /* Remote frame: no data, DLC kept. */
+  e[0] = (0x123u << 18) | (1u << 29);
+  e[1] = 4u << 16;
+  logrec_rx_element(&r, 2, e);
+  assert(r.id == 0x123 && r.dlc == 4 && r.type == (LOGREC_RX | LOGREC_RTR));
+  for (i = 0; i < 8; i++) assert(r.data[i] == 0);
+  puts("rx element   ok");
 }
 
 static void test_logrec(void)
@@ -279,6 +330,7 @@ int main(void)
 {
   test_ringbuf();
   test_logrec();
+  test_rx_element();
   test_jsonl_format();
   test_jsonl_stage();
   test_timekeeping();
