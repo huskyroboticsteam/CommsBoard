@@ -52,6 +52,12 @@ void logrec_drop(log_rec_t *r, uint32_t t_us, uint32_t count);
 void logrec_sys(log_rec_t *r, uint32_t t_us, uint8_t event);
 void logrec_tset(log_rec_t *r, uint32_t t_us, uint32_t old_unix, uint32_t new_unix);
 
+/* Build an "rx" record from an FDCAN RX FIFO element (classic CAN, standard ID) as it
+ * sits in the message RAM: e[0..1] header, e[2..3] the first 8 data bytes. A DLC of
+ * 9-15 is legal in classic CAN and still means 8 bytes; at most 8 are ever copied.
+ * Word reads only (the message RAM is word-wide). Pure code: tested on a PC. */
+void logrec_rx_element(log_rec_t *r, uint32_t t_us, const volatile uint32_t *e);
+
 /* Read a little-endian uint32 out of data[] at the given offset. */
 uint32_t logrec_u32(const log_rec_t *r, int offset);
 
