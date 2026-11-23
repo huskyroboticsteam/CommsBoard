@@ -25,4 +25,14 @@ int ringbuf_push(ringbuf_t *r, const log_rec_t *rec);   /* 1 = stored, 0 = full 
 int ringbuf_pop(ringbuf_t *r, log_rec_t *rec);          /* 1 = got one, 0 = empty */
 uint32_t ringbuf_count(const ringbuf_t *r);
 
+/* Zero-copy variants, for hot paths that build a record in place.
+ * Writer: ringbuf_slot() returns the next free slot (NULL = full); fill it, then
+ * ringbuf_commit() publishes it. Nothing is visible to the reader until the commit.
+ * Reader: ringbuf_peek() returns the oldest record without removing it (NULL = empty);
+ * ringbuf_drop() removes it. */
+log_rec_t *ringbuf_slot(ringbuf_t *r);
+void ringbuf_commit(ringbuf_t *r);
+const log_rec_t *ringbuf_peek(const ringbuf_t *r);
+void ringbuf_drop(ringbuf_t *r);
+
 #endif /* RINGBUF_H */
