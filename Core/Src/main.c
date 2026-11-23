@@ -189,11 +189,11 @@ void SystemClock_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* Reset rather than spin. Error_Handler() can run before the watchdog is started (a
+   * crystal that will not start makes SystemClock_Config() fail), and a spin there
+   * would hang the board for good with no LED and no reset. */
   __disable_irq();
-  while (1)
-  {
-  }
+  NVIC_SystemReset();
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
