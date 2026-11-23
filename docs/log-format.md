@@ -80,7 +80,7 @@ Every other line starts with the same four keys:
 | `tx` | A frame this board sent was acknowledged on the bus | Same as `rx` |
 | `time` | Once a second | `rtc`: Unix seconds, or 0 if the RTC is not set |
 | `err` | The CAN error state changes | `tec`, `rec`: error counters. `lec`: last error code. `st`: `ok`, `warn`, `passive` or `busoff`. |
-| `drop` | Space returns after an overflow | `cnt`: records lost. A lower bound: when the CAN hardware's own FIFO overflows, it does not say how many frames went. |
+| `drop` | Space returns after an overflow; or right after `start`/`recover` if records were thrown away while nothing was being written | `cnt`: records lost. A lower bound: when the CAN hardware's own FIFO overflows, it does not say how many frames went. Records that waited more than 30 minutes with no card are thrown away rather than written with a timestamp that can no longer be worked out. |
 | `sys` | A logger or system event | `ev`: see below |
 | `tset` | The RTC is set | `old`, `new`: Unix seconds |
 
