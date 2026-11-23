@@ -56,6 +56,7 @@ static void print_stats(void)
   p = fmt_str(p, "/s tx ");       p = fmt_u32(p, (can.tx_frames - last_tx) / secs);
   p = fmt_str(p, "/s drop ");     p = fmt_u32(p, can.rx_dropped);       /* lost in the interrupt */
   p = fmt_str(p, "+");            p = fmt_u32(p, ct.log_dropped);       /* lost because the log ring was full */
+  p = fmt_str(p, "+");            p = fmt_u32(p, lg.stale_dropped);     /* thrown away: waited too long with no card */
   p = fmt_str(p, " txfail ");     p = fmt_u32(p, ct.tx_queue_full + ct.tx_refused);
   p = fmt_str(p, " | ring hi ");  p = fmt_u32(p, log_ring.high_water);
   p = fmt_str(p, "/");            p = fmt_u32(p, LOG_RING_RECORDS - 1);
