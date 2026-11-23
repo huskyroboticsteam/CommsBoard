@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* No SPI registers here: sd_spi.c sends single bytes through HAL_SPI_TransmitReceive(),
+ * where tests/test_logger.c has its SD card emulator. */
+#define SD_SPI_HAL_XCHG 1
+
 typedef enum { HAL_OK = 0, HAL_ERROR, HAL_BUSY, HAL_TIMEOUT } HAL_StatusTypeDef;
 
 typedef struct { uint32_t CR1; } SPI_TypeDef;
