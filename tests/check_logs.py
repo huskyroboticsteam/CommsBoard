@@ -107,6 +107,11 @@ assert size == 16 * 1024 * 1024, size
 # gap no bigger than what was staged in RAM (4 KB of lines) plus the write that failed.
 hdr1, p1 = part("B00004_01.jsonl")
 hdr2, p2 = part("B00004_02.jsonl")
+# This boot started with 5 records too old to timestamp: thrown away, and said so first thing.
+assert p1[0]["k"] == "sys" and p1[0]["ev"] == "start", p1[0]
+assert p1[1]["k"] == "drop" and p1[1]["cnt"] == 5, p1[1]
+assert not any(r["k"] == "time" for r in p1[:3]), "a stale record was written"
+assert p1[0]["t"] > 2 ** 32, p1[0]   # two hours in: times past 32 bits print correctly
 gap = p2[0]["n"] - p1[-1]["n"] - 1
 assert p2[0]["k"] == "sys" and p2[0]["ev"] == "recover", p2[0]
 assert 0 < gap <= 2 * (4096 // 40), gap
