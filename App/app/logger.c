@@ -36,6 +36,12 @@
 
 #define RETRY_DELAY_MS  200     /* between card start-up tries */
 
+/* Records carry only the low 32 bits of the microsecond clock, so a record's age can be
+ * worked out only while it is under 2^31 us (35.8 minutes) old. While nothing is being
+ * written (no card, card fault, card full), records older than this are thrown away and
+ * counted, well before their timestamps would turn ambiguous. */
+#define STALE_AGE_US    (30u * 60u * 1000000u)
+
 static char stage_buf[JSON_STAGING_BYTES];
 static jsonl_stage_t stage;
 static logger_stats_t stats;
@@ -47,6 +53,7 @@ static int boot_rtc_ok;
 static int recovering;          /* the next part opens after a card fault */
 static int init_tries;          /* failed card start-ups in a row */
 static uint32_t wait_start_ms;  /* when the current retry delay or fault began */
+static uint32_t stale_pending;  /* stale records thrown away and not yet reported in the log */
 
 /* The SD driver calls this whenever the card answers: we are alive. */
 static void sd_progress(void)
@@ -96,16 +103,38 @@ static int put_line(const char *line, size_t len)
   return jsonl_stage_add(&stage, line, len) ? 0 : -1;
 }
 
-/* A record the logger writes itself (not from the ring). */
-static int put_sys(uint8_t event)
+/* A record the logger writes itself (not from the ring), stamped "now". */
+static int put_own(log_rec_t *rec)
 {
   char line[JSONL_MAX_LINE];
   uint64_t now = timebase_now_us();
+
+  rec->t_us = (uint32_t)now;
+  stats.lines++;
+  return put_line(line, jsonl_format(line, stats.boot_id, seq++, now, rec));
+}
+
+static int put_sys(uint8_t event)
+{
   log_rec_t rec;
 
-  logrec_sys(&rec, (uint32_t)now, event);
-  stats.lines++;
-  return put_line(line, jsonl_format(line, stats.boot_id, seq++, now, &rec));
+  logrec_sys(&rec, 0, event);
+  return put_own(&rec);
+}
+
+/* Throw away records too old to timestamp (see STALE_AGE_US). Only runs while the
+ * logger is not draining the ring, so it never races the normal reader: it IS the reader. */
+static void drop_stale(void)
+{
+  const log_rec_t *oldest;
+  uint32_t now = timebase_now_lo();
+
+  /* Signed age: a record stamped just after "now" was read is fresh, not ancient. */
+  while ((oldest = ringbuf_peek(&log_ring)) != 0 && (int32_t)(now - oldest->t_us) > (int32_t)STALE_AGE_US) {
+    ringbuf_drop(&log_ring);
+    stale_pending++;
+    stats.stale_dropped++;
+  }
 }
 
 /* INIT: start the card, mount it, work out the boot ID and check free space. */
@@ -157,8 +186,15 @@ static void do_open(void)
   stage.len = 0;
   last_flush_ms = timebase_ms();
   stats.state = LOGGER_LOGGING;
-  if (put_sys(recovering ? LOGREC_EV_RECOVER : LOGREC_EV_START) != 0) enter_fault();
-  else recovering = 0;
+  if (put_sys(recovering ? LOGREC_EV_RECOVER : LOGREC_EV_START) != 0) { enter_fault(); return; }
+  recovering = 0;
+  if (stale_pending) {          /* say how many records were thrown away while we were down */
+    log_rec_t rec;
+
+    logrec_drop(&rec, 0, stale_pending);
+    if (put_own(&rec) != 0) { enter_fault(); return; }
+    stale_pending = 0;
+  }
 }
 
 /* LOGGING: drain the ring into JSON lines; write full stages, and at least once a second. */
@@ -198,6 +234,8 @@ void logger_init(void)
 
 void logger_poll(void)
 {
+  if (stats.state != LOGGER_LOGGING) drop_stale();
+
   switch (stats.state) {
   case LOGGER_INIT:
     do_init();
