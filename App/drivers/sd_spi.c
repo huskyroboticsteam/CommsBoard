@@ -21,6 +21,7 @@
 #define CMD9    9       /* SEND_CSD: card size info */
 #define CMD12   12      /* STOP_TRANSMISSION */
 #define CMD16   16      /* SET_BLOCKLEN */
+#define ACMD23  (0x80 | 23) /* SET_WR_BLK_ERASE_COUNT: pre-erase before a multi-block write */
 #define CMD17   17      /* READ_SINGLE_BLOCK */
 #define CMD18   18      /* READ_MULTIPLE_BLOCK */
 #define CMD24   24      /* WRITE_BLOCK */
@@ -55,6 +56,8 @@ const SD_Stats *SD_GetStats(void)
   return &stats;
 }
 
+static void spi_byte_mode(void);
+
 /* Pick the fastest SPI clock that does not exceed hz (SPI1 runs from PCLK2). */
 static void set_speed(uint32_t hz)
 {
@@ -65,6 +68,7 @@ static void set_speed(uint32_t hz)
   __HAL_SPI_DISABLE(&hspi);             /* the speed may only change while SPI is off; HAL turns it back on */
   MODIFY_REG(hspi.Instance->CR1, SPI_CR1_BR, br << SPI_CR1_BR_Pos);
   hspi.Init.BaudRatePrescaler = br << SPI_CR1_BR_Pos;
+  spi_byte_mode();
 }
 
 /* Let the rest of the firmware run for a moment. Every loop that waits on the card
@@ -74,13 +78,47 @@ static void yield(void)
   if (hooks.wait) hooks.wait();
 }
 
-/* Send one byte and return the byte the card sent back at the same time. */
+#ifdef SD_SPI_HAL_XCHG
+/* PC tests: the fake HAL has no registers; the SD card emulator sits behind
+ * HAL_SPI_TransmitReceive(). */
+static void spi_byte_mode(void) { }
+
 static uint8_t xchg(uint8_t out)
 {
   uint8_t in = 0xFF;
   HAL_SPI_TransmitReceive(&hspi, &out, &in, 1, SPI_TIMEOUT_MS);
   return in;
 }
+#else
+/* Single bytes go straight through the SPI registers. Every command byte, every
+ * "are you busy?" poll and every CRC byte is a 1-byte transfer, and HAL_SPI_TransmitReceive()
+ * spends far longer checking state and setting up than the byte itself takes on the wire
+ * (0.4 us at 21 MHz). Block transfers still use the HAL (DMA or polled).
+ *
+ * spi_byte_mode() must run after any HAL transfer and after a speed change: the HAL
+ * leaves the RX FIFO threshold at 16 bits after multi-byte transfers (RXNE would then
+ * never fire for one byte) and set_speed() turns the SPI off. It also empties the RX FIFO,
+ * so the next byte read really is the reply to the next byte sent. */
+static void spi_byte_mode(void)
+{
+  SPI_TypeDef *spi = hspi.Instance;
+
+  SET_BIT(spi->CR2, SPI_CR2_FRXTH);              /* RXNE as soon as one byte is in */
+  while (spi->SR & SPI_SR_RXNE) (void)*(volatile uint8_t *)&spi->DR;
+  (void)spi->SR;                                 /* with the DR read above, clears a stale overrun */
+  SET_BIT(spi->CR1, SPI_CR1_SPE);
+}
+
+static uint8_t xchg(uint8_t out)
+{
+  SPI_TypeDef *spi = hspi.Instance;
+
+  while (!(spi->SR & SPI_SR_TXE)) { }
+  *(volatile uint8_t *)&spi->DR = out;           /* 8-bit access: a 16-bit write would send two bytes */
+  while (!(spi->SR & SPI_SR_RXNE)) { }           /* master, full duplex: always arrives after 8 clocks */
+  return *(volatile uint8_t *)&spi->DR;
+}
+#endif
 
 /* Wait until the card stops holding MISO low (busy). 1 = ready, 0 = timed out.
  * Polls flat out at first (the usual wait is short), then calls the wait hook between
@@ -205,10 +243,15 @@ static int rcvr_datablock(uint8_t *buf, uint32_t len)
   memset(buf, 0xFF, len);
   if (can_dma(buf, len)) {
     dma_state = DMA_BUSY;
-    if (HAL_SPI_TransmitReceive_DMA(&hspi, buf, buf, (uint16_t)len) != HAL_OK || !dma_wait()) return 0;
+    if (HAL_SPI_TransmitReceive_DMA(&hspi, buf, buf, (uint16_t)len) != HAL_OK || !dma_wait()) {
+      spi_byte_mode();
+      return 0;
+    }
   } else if (HAL_SPI_TransmitReceive(&hspi, buf, buf, (uint16_t)len, SPI_TIMEOUT_MS) != HAL_OK) {
+    spi_byte_mode();
     return 0;
   }
+  spi_byte_mode();
   xchg(0xFF);                   /* discard CRC */
   xchg(0xFF);
   if (hooks.progress) hooks.progress();
@@ -226,10 +269,15 @@ static int xmit_datablock(const uint8_t *buf, uint8_t token)
 
   if (can_dma(buf, 512)) {
     dma_state = DMA_BUSY;
-    if (HAL_SPI_Transmit_DMA(&hspi, (uint8_t *)buf, 512) != HAL_OK || !dma_wait()) return 0;
+    if (HAL_SPI_Transmit_DMA(&hspi, (uint8_t *)buf, 512) != HAL_OK || !dma_wait()) {
+      spi_byte_mode();
+      return 0;
+    }
   } else if (HAL_SPI_Transmit(&hspi, (uint8_t *)buf, 512, SPI_TIMEOUT_MS) != HAL_OK) {
+    spi_byte_mode();
     return 0;
   }
+  spi_byte_mode();              /* transmit-only: drops the bytes the card clocked back */
   xchg(0xFF);                   /* dummy CRC */
   xchg(0xFF);
   resp = xchg(0xFF);            /* data response: xxx00101 = accepted */
@@ -308,13 +356,19 @@ SD_Result SD_WriteBlocks(const uint8_t *buf, uint32_t sector, uint32_t count)
 
   if (count == 1) {
     if (send_cmd(CMD24, sector) == 0 && xmit_datablock(buf, 0xFE)) res = SD_OK;
-  } else if (send_cmd(CMD25, sector) == 0) {
-    do {
-      if (!xmit_datablock(buf, 0xFC)) break;
-      buf += 512;
-    } while (--count);
-    if (!xmit_datablock(NULL, 0xFD)) count = 1;     /* stop token */
-    if (count == 0) res = SD_OK;
+  } else {
+    /* Tell the card how many blocks are coming so it can erase them up front: many
+     * cards write a multi-block run noticeably faster this way. Every card this driver
+     * accepts is an SD card (MMC is refused in SD_Init), and the reply does not matter. */
+    send_cmd(ACMD23, count);
+    if (send_cmd(CMD25, sector) == 0) {
+      do {
+        if (!xmit_datablock(buf, 0xFC)) break;
+        buf += 512;
+      } while (--count);
+      if (!xmit_datablock(NULL, 0xFD)) count = 1;   /* stop token */
+      if (count == 0) res = SD_OK;
+    }
   }
   /* The card is busy until the data is really stored: wait here so the time we
    * measure, and the result we return, cover the whole write. */
