@@ -62,7 +62,7 @@
 #define _USE_FASTSEEK        1
 /* This option switches fast seek feature. (0:Disable or 1:Enable) */
 
-#define	_USE_EXPAND		0
+#define	_USE_EXPAND		1
 /* This option switches f_expand function. (0:Disable or 1:Enable) */
 
 #define _USE_CHMOD		0
@@ -108,7 +108,7 @@
 /   950 - Traditional Chinese (DBCS)
 */
 
-#define _USE_LFN     0    /* 0 to 3 */
+#define _USE_LFN     1    /* 0 to 3 */
 #define _MAX_LFN     255  /* Maximum LFN length to handle (12 to 255) */
 /* The _USE_LFN switches the support of long file name (LFN).
 /
