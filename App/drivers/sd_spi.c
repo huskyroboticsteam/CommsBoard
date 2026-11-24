@@ -38,6 +38,10 @@
 #define SPI_TIMEOUT_MS    100   /* one SPI transfer */
 #define READ_TOKEN_MS     200   /* card must start sending read data within this */
 #define SPIN_BEFORE_YIELD_US 2000  /* poll flat out this long, then let other work run between polls */
+/* Loop passes to wait for one byte before giving up. A byte takes 24 us at the slowest
+ * clock, a few hundred passes; this is several milliseconds, so it only trips if the SPI
+ * itself has stopped. A count, not a clock read, because this is the hottest path. */
+#define XCHG_SPIN_LIMIT   100000u
 
 enum { DMA_IDLE = 0, DMA_BUSY, DMA_DONE, DMA_ERROR };
 
@@ -45,6 +49,7 @@ static uint8_t card_type;   /* 0 = not initialized */
 static SD_Hooks hooks;
 static SD_Stats stats;
 static volatile uint8_t dma_state;
+static uint8_t spi_fault;   /* a byte transfer timed out during the operation under way */
 
 void SD_SetHooks(const SD_Hooks *h)
 {
@@ -57,6 +62,18 @@ const SD_Stats *SD_GetStats(void)
 }
 
 static void spi_byte_mode(void);
+
+/* Every public operation ends here. A byte that timed out reads as 0xFF, which also
+ * means "card ready" or "no reply", so the low-level code cannot tell on its own:
+ * whatever the operation concluded, a timed-out byte anywhere in it makes it fail. */
+static SD_Result finish(SD_Result res)
+{
+  if (spi_fault) {
+    spi_fault = 0;
+    return SD_TIMEOUT;
+  }
+  return res;
+}
 
 /* Pick the fastest SPI clock that does not exceed hz (SPI1 runs from PCLK2). */
 static void set_speed(uint32_t hz)
@@ -86,7 +103,11 @@ static void spi_byte_mode(void) { }
 static uint8_t xchg(uint8_t out)
 {
   uint8_t in = 0xFF;
-  HAL_SPI_TransmitReceive(&hspi, &out, &in, 1, SPI_TIMEOUT_MS);
+
+  if (HAL_SPI_TransmitReceive(&hspi, &out, &in, 1, SPI_TIMEOUT_MS) != HAL_OK) {
+    spi_fault = 1;
+    return 0xFF;
+  }
   return in;
 }
 #else
@@ -103,19 +124,34 @@ static void spi_byte_mode(void)
 {
   SPI_TypeDef *spi = hspi.Instance;
 
+  int n;
+
   SET_BIT(spi->CR2, SPI_CR2_FRXTH);              /* RXNE as soon as one byte is in */
-  while (spi->SR & SPI_SR_RXNE) (void)*(volatile uint8_t *)&spi->DR;
+  for (n = 0; n < 8 && (spi->SR & SPI_SR_RXNE); n++) (void)*(volatile uint8_t *)&spi->DR;   /* the FIFO holds 4 */
   (void)spi->SR;                                 /* with the DR read above, clears a stale overrun */
   SET_BIT(spi->CR1, SPI_CR1_SPE);
+}
+
+/* The SPI stopped moving bytes. Put it back into a known state and flag the operation. */
+static uint8_t xchg_timed_out(void)
+{
+  spi_fault = 1;
+  spi_byte_mode();
+  return 0xFF;
 }
 
 static uint8_t xchg(uint8_t out)
 {
   SPI_TypeDef *spi = hspi.Instance;
+  uint32_t spins = XCHG_SPIN_LIMIT;
 
-  while (!(spi->SR & SPI_SR_TXE)) { }
+  while (!(spi->SR & SPI_SR_TXE)) {
+    if (--spins == 0) return xchg_timed_out();
+  }
   *(volatile uint8_t *)&spi->DR = out;           /* 8-bit access: a 16-bit write would send two bytes */
-  while (!(spi->SR & SPI_SR_RXNE)) { }           /* master, full duplex: always arrives after 8 clocks */
+  while (!(spi->SR & SPI_SR_RXNE)) {             /* master, full duplex: arrives after 8 clocks */
+    if (--spins == 0) return xchg_timed_out();
+  }
   return *(volatile uint8_t *)&spi->DR;
 }
 #endif
@@ -318,6 +354,7 @@ SD_Result SD_Init(void)
   }
   cs_deselect();
 
+  if (finish(SD_OK) != SD_OK) return SD_TIMEOUT;
   if (!ty) return SD_NO_CARD;
   card_type = ty;
   set_speed(SD_SPI_FAST_HZ);
@@ -342,6 +379,7 @@ SD_Result SD_ReadBlocks(uint8_t *buf, uint32_t sector, uint32_t count)
     if (count == 0) res = SD_OK;
   }
   cs_deselect();
+  res = finish(res);
   if (res != SD_OK) stats.errors++;
   return res;
 }
@@ -374,6 +412,7 @@ SD_Result SD_WriteBlocks(const uint8_t *buf, uint32_t sector, uint32_t count)
    * measure, and the result we return, cover the whole write. */
   if (res == SD_OK && !wait_ready(SD_WRITE_TIMEOUT_MS)) res = SD_TIMEOUT;
   cs_deselect();
+  res = finish(res);
 
   dt = timebase_now_lo() - t0;
   stats.writes++;
@@ -387,7 +426,7 @@ SD_Result SD_Sync(void)
 {
   SD_Result res = cs_select() ? SD_OK : SD_TIMEOUT; /* cs_select() waits for not-busy */
   cs_deselect();
-  return res;
+  return finish(res);
 }
 
 uint32_t SD_GetSectorCount(void)
@@ -408,5 +447,5 @@ uint32_t SD_GetSectorCount(void)
     }
   }
   cs_deselect();
-  return sectors;
+  return (finish(SD_OK) == SD_OK) ? sectors : 0;
 }

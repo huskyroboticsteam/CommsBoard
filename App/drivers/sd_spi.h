@@ -14,7 +14,7 @@ typedef enum {
   SD_OK = 0,
   SD_ERROR,     /* card answered, but with an error (or rejected the data) */
   SD_NO_CARD,   /* nothing answered on the bus */
-  SD_TIMEOUT,   /* card stayed busy too long */
+  SD_TIMEOUT,   /* card stayed busy too long, or the SPI stopped moving bytes */
 } SD_Result;
 
 typedef struct {

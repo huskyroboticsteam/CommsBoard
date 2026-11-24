@@ -52,7 +52,8 @@ int can_drv_init(uint32_t bitrate, int loopback)
 
   if (HAL_FDCAN_ActivateNotification(h, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_MESSAGE_LOST
                                       | FDCAN_IT_TX_EVT_FIFO_NEW_DATA | FDCAN_IT_TX_EVT_FIFO_ELT_LOST
-                                      | FDCAN_IT_ERROR_WARNING | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF, 0) != HAL_OK) return -1;
+                                      | FDCAN_IT_ERROR_WARNING | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_BUS_OFF
+                                      | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR, 0) != HAL_OK) return -1;
   return (HAL_FDCAN_Start(h) == HAL_OK) ? 0 : -1;
 }
 
@@ -185,22 +186,48 @@ void HAL_FDCAN_TxEventFifoCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t TxEvent
   }
 }
 
-void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
+/* Write one "err" record with the controller's state right now.
+ * This is the only place the protocol status register is read, because reading it resets
+ * the last error code to "no change". If two error interrupts are handled together, the
+ * second read therefore finds "no change": with skip_if_unchanged set, that duplicate is
+ * not written. */
+static void log_error_state(FDCAN_HandleTypeDef *hfdcan, int skip_if_unchanged)
 {
   FDCAN_ProtocolStatusTypeDef ps;
   FDCAN_ErrorCountersTypeDef ec;
   log_rec_t rec;
 
-  (void)ErrorStatusITs;
-  HAL_FDCAN_GetProtocolStatus(hfdcan, &ps);   /* the only place this register is read */
+  HAL_FDCAN_GetProtocolStatus(hfdcan, &ps);
   HAL_FDCAN_GetErrorCounters(hfdcan, &ec);
   bus_state = error_state(&ps);
-  logrec_err(&rec, timebase_now_lo(), (uint8_t)ec.TxErrorCnt, (uint8_t)ec.RxErrorCnt,
-             (uint8_t)ps.LastErrorCode, bus_state);
-  if (!ringbuf_push(&rx_ring, &rec)) rx_dropped++;
-
   if (ps.BusOff && !busoff_pending) {
     busoff_tick = HAL_GetTick();
     busoff_pending = 1;               /* can_drv_service() restarts us after the delay */
   }
+  if (skip_if_unchanged && ps.LastErrorCode == FDCAN_PROTOCOL_ERROR_NO_CHANGE) return;
+
+  logrec_err(&rec, timebase_now_lo(), (uint8_t)ec.TxErrorCnt, (uint8_t)ec.RxErrorCnt,
+             (uint8_t)ps.LastErrorCode, bus_state);
+  if (!ringbuf_push(&rx_ring, &rec)) rx_dropped++;
+}
+
+/* The error state changed: error-warning, error-passive or bus-off, in either direction. */
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
+{
+  (void)ErrorStatusITs;
+  log_error_state(hfdcan, 0);
+}
+
+/* A protocol error on the bus (bit, stuff, form, ACK or CRC error): one "err" record
+ * each, with the kind of error in "lec". On a bus with nobody acknowledging, the
+ * controller retries and these keep coming; if the RX ring fills they are dropped and
+ * counted like any other record.
+ * The HAL calls this from the same interrupt, after the state-change callback above. */
+void HAL_FDCAN_ErrorCallback(FDCAN_HandleTypeDef *hfdcan)
+{
+  if (hfdcan->ErrorCode & (HAL_FDCAN_ERROR_PROTOCOL_ARBT | HAL_FDCAN_ERROR_PROTOCOL_DATA)) {
+    log_error_state(hfdcan, 1);
+  }
+  /* The HAL never clears this, and calls us again on every interrupt while it is set. */
+  hfdcan->ErrorCode = HAL_FDCAN_ERROR_NONE;
 }

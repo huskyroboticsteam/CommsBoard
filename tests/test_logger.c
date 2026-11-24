@@ -61,6 +61,7 @@ ringbuf_t log_ring;
 static uint8_t *img;                   /* CARD_SECTORS * 512 bytes of shared memory */
 static int cs_low, reject_writes;
 static int read_delay;                 /* 0xFF bytes the card sends before read data (a slow card) */
+static int busy_len = 3;               /* bytes the card stays busy after each block written */
 static uint8_t q[2048]; static unsigned qh, qt;      /* bytes the card will send */
 static uint8_t cmd[6]; static int cmdlen;
 static int idle, app, acmd41_calls;
@@ -133,7 +134,7 @@ static uint8_t card_byte(uint8_t in)
     if (wr_cnt == 514) {
       if (reject_writes) put(0x0D);                   /* data rejected: write error */
       else { assert(wr_addr < CARD_SECTORS); memcpy(img + (size_t)wr_addr++ * 512, wr_buf, 512); put(0x05); }
-      put(0); put(0); put(0);                         /* busy for a few bytes */
+      for (int i = 0; i < busy_len; i++) put(0);      /* busy for a while */
       wr_cnt = -1;
       if (wr_mode == 1) wr_mode = 0;
     }
@@ -151,8 +152,14 @@ void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state)
   cs_low = state == GPIO_PIN_RESET;
   if (!cs_low) { cmdlen = 0; qh = qt; wr_mode = 0; rd_multi = 0; }
 }
+static int spi_stuck;                  /* the SPI itself has stopped moving bytes */
 HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *h, uint8_t *tx, uint8_t *rx, uint16_t n, uint32_t t)
-{ (void)h; (void)t; for (int i = 0; i < n; i++) rx[i] = card_byte(tx[i]); return HAL_OK; }
+{
+  (void)h; (void)t;
+  if (spi_stuck) return HAL_TIMEOUT;
+  for (int i = 0; i < n; i++) rx[i] = card_byte(tx[i]);
+  return HAL_OK;
+}
 static void feed(int max);
 HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *h, uint8_t *tx, uint16_t n, uint32_t t)
 {
@@ -301,6 +308,16 @@ int main(void)
   read_delay = 50;                                    /* a card that is slow to produce read data */
   assert(SD_ReadBlocks(work, 0, 1) == SD_OK && yields > 0);
   read_delay = 0;
+
+  /* A byte that times out must fail the operation. It must never be mistaken for the
+   * 0xFF that means "card ready". And the driver must recover once the SPI works again. */
+  spi_stuck = 1;
+  assert(SD_Sync() != SD_OK);
+  assert(SD_ReadBlocks(work, 0, 1) != SD_OK);
+  assert(SD_WriteBlocks(work, 0, 1) != SD_OK);
+  spi_stuck = 0;
+  assert(SD_Sync() == SD_OK);
+  assert(SD_ReadBlocks(work, 0, 1) == SD_OK);
   assert(f_mkfs(USERPath, FM_ANY, 0, work, sizeof work) == FR_OK);
   assert(acmd23_calls > 0 && acmd23_bad == 0);        /* multi-block writes announce their size */
 
@@ -314,7 +331,11 @@ int main(void)
   assert(r.stats.boot_id == 2 && r.stats.part == 1 && r.stats.lines == 1001);
 
   /* Boot 3: enough data to fill a part and roll over into the next. */
+  busy_len = 40;                                      /* a card slow enough that the driver has to wait */
   r = boot(260000, 0, 0);
+  busy_len = 3;
+  /* While one staging buffer was being written, the other was being filled. */
+  assert(r.stats.lines_during_write > 1000);
   assert(r.stats.boot_id == 3 && r.stats.part == 2 && r.stats.faults == 0);
   assert(r.stats.lines == 260000 + 2);
 

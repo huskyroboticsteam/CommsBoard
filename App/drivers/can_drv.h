@@ -3,7 +3,7 @@
   *
   * Receive: every standard-ID frame on the bus is accepted. The interrupt timestamps
   * each frame and copies it into the RX ring as a 16-byte record; it never waits.
-  * Error-state changes arrive in the same ring as "err" records.
+  * Error-state changes and protocol errors arrive in the same ring as "err" records.
   * Transmit: can_drv_tx() puts one frame into the 3-slot hardware FIFO. When the
   * controller reports that the frame really went out on the bus (it was acknowledged),
   * a "tx" record appears in the RX ring. A frame nobody acknowledges is retried by the

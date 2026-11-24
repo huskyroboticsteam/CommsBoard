@@ -24,7 +24,9 @@ void app_loop(void);        /* one pass of the main loop */
  * would re-enter itself and corrupt the card. Anything can_task_poll() or status_poll()
  * ever wants written to the card must go through the log ring.
  * The one exception is reading counters: SD_GetStats() and logger_get_stats() only copy
- * numbers and start nothing, so status_poll() may call them. */
+ * numbers and start nothing, so status_poll() may call them.
+ * (The logger's own wait hook also formats records into its second buffer during a
+ * write. That only touches the log ring and RAM, never the card.) */
 void app_yield(void);
 
 /* Longest time between two runs of the CAN job since this was last called (us). */
@@ -63,6 +65,7 @@ typedef struct {
   uint32_t boot_id;
   uint32_t part;            /* file part being written */
   uint32_t lines;           /* JSON lines formatted this boot */
+  uint32_t lines_during_write;  /* of those, formatted into the second buffer while the first was being written */
   uint64_t bytes;           /* bytes written to the card this boot */
   uint32_t faults;          /* times the logger entered FAULT */
   uint32_t stale_dropped;   /* records thrown away unwritten because they waited too long (no card) */

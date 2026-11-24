@@ -5,6 +5,10 @@
   * formats each as one JSON line, packs whole lines into 512-byte blocks in a staging
   * buffer, and writes the buffer when it is full or once a second.
   *
+  * There are two staging buffers. While one is being written to the card, the SD driver
+  * keeps calling our wait hook, and the hook formats the records that arrive meanwhile
+  * into the other one. So formatting uses the time the card would otherwise make us wait.
+  *
   * A card write can take a long time. While the SD driver waits on the card it calls
   * app_yield(), which keeps CAN routing running. If the card is missing, slow or broken,
   * the ring fills, and can_task drops and counts.
@@ -42,8 +46,10 @@
  * counted, well before their timestamps would turn ambiguous. */
 #define STALE_AGE_US    (30u * 60u * 1000000u)
 
-static char stage_buf[JSON_STAGING_BYTES];
-static jsonl_stage_t stage;
+static char stage_buf[2][JSON_STAGING_BYTES];
+static jsonl_stage_t stages[2];
+static jsonl_stage_t *fill = &stages[0];   /* the buffer lines are being added to */
+static int writing;                        /* the other buffer is on its way to the card right now */
 static logger_stats_t stats;
 static uint32_t seq;            /* "n" of the next line; runs on across parts */
 static uint64_t part_bytes;     /* written to the current part, header included */
@@ -69,38 +75,74 @@ void logger_get_stats(logger_stats_t *out)
 static void enter_fault(void)
 {
   storage_close();
-  stage.len = 0;                /* whatever was staged is lost with the card */
+  stages[0].len = stages[1].len = 0;    /* whatever was staged is lost with the card */
+  writing = 0;
   stats.state = LOGGER_FAULT;
   stats.faults++;
   recovering = 1;
   wait_start_ms = timebase_ms();
 }
 
-/* Write the staged blocks to the card. Returns 0 on success. */
-static int flush(void)
+/* Turn waiting records into JSON lines in the fill buffer. Stops when the ring is empty
+ * or the buffer is full (returns 1), leaving the record that did not fit in the ring.
+ * Only touches the ring and RAM, never the card, so the SD wait hook may call it. */
+static int format_records(void)
 {
-  int res;
+  char line[JSONL_MAX_LINE];
+  const log_rec_t *rec;
+  uint64_t now = timebase_now_us();
+  uint32_t n = 0;
+  size_t len;
 
-  last_flush_ms = timebase_ms();
-  if (stage.len == 0) return 0;
-  jsonl_stage_pad(&stage);
-  led_set(LED_SD, 1);
-  res = storage_write(stage.buf, (uint32_t)stage.len);
-  led_set(LED_SD, 0);
-  /* Chapter 6: a write slower than SD_WRITE_TIMEOUT_MS goes to RECOVER instead. */
-  if (res != 0) return -1;
-  stats.bytes += stage.len;
-  part_bytes += stage.len;
-  stage.len = 0;
+  while ((rec = ringbuf_peek(&log_ring)) != 0) {
+    if ((++n & 0xFF) == 0) now = timebase_now_us();     /* keep "now" fresh during long drains */
+    len = jsonl_format(line, stats.boot_id, seq, tk_extend_us(now, rec->t_us), rec);
+    if (!jsonl_stage_add(fill, line, len)) return 1;
+    ringbuf_drop(&log_ring);
+    seq++;
+    stats.lines++;
+    if (writing) stats.lines_during_write++;
+  }
   return 0;
 }
 
-/* Add one line to the stage, writing the stage out first if it is full. */
+/* The SD driver calls this over and over while it waits on the card. */
+static void sd_wait(void)
+{
+  app_yield();                      /* CAN routing and status must not wait for the card */
+  if (writing) format_records();    /* fill the second buffer while the first is written */
+}
+
+/* Write the fill buffer to the card. Returns 0 on success.
+ * With use_wait set, records that arrive during the write are formatted into the other
+ * buffer, which then becomes the fill buffer. */
+static int flush(int use_wait)
+{
+  jsonl_stage_t *out = fill;
+  int res;
+
+  last_flush_ms = timebase_ms();
+  if (out->len == 0) return 0;
+  jsonl_stage_pad(out);
+  fill = (out == &stages[0]) ? &stages[1] : &stages[0];   /* empty: its own write finished earlier */
+  writing = use_wait;
+  led_set(LED_SD, 1);
+  res = storage_write(out->buf, (uint32_t)out->len);
+  led_set(LED_SD, 0);
+  writing = 0;
+  /* Chapter 6: a write slower than SD_WRITE_TIMEOUT_MS goes to RECOVER instead. */
+  if (res != 0) return -1;
+  stats.bytes += out->len;
+  part_bytes += out->len;
+  out->len = 0;
+  return 0;
+}
+
+/* Add one of the logger's own lines. Only used right after a part is opened, when the
+ * fill buffer is empty, so it always fits. */
 static int put_line(const char *line, size_t len)
 {
-  if (jsonl_stage_add(&stage, line, len)) return 0;
-  if (flush() != 0) return -1;
-  return jsonl_stage_add(&stage, line, len) ? 0 : -1;
+  return jsonl_stage_add(fill, line, len) ? 0 : -1;
 }
 
 /* A record the logger writes itself (not from the ring), stamped "now". */
@@ -169,21 +211,21 @@ static void do_open(void)
   jsonl_hdr_t hdr = { FW_GIT_HASH, BOARD_NAME, stats.boot_id, board_reset_cause(),
                       boot_rtc, boot_rtc_ok, CAN_BITRATE_BPS, CAN_LOOPBACK };
 
-  stage.len = jsonl_format_header(stage.buf, stage.cap, &hdr);
-  jsonl_stage_pad(&stage);
   if (stats.part >= 99) {                   /* file names only have two digits for the part */
-    stage.len = 0;
     stats.state = LOGGER_CARD_FULL;         /* stop here; retrying could never succeed */
     return;
   }
+  /* Both buffers are empty here, so the fill buffer doubles as scratch for the header block. */
+  fill->len = jsonl_format_header(fill->buf, fill->cap, &hdr);
+  jsonl_stage_pad(fill);
   stats.part++;                             /* used up even if the open fails: a retry never reuses a name */
-  if (storage_open_part(stats.boot_id, stats.part, LOG_PREALLOC_MB, stage.buf) != 0) {
+  if (storage_open_part(stats.boot_id, stats.part, LOG_PREALLOC_MB, fill->buf) != 0) {
     enter_fault();
     return;
   }
-  stats.bytes += stage.len;
-  part_bytes = stage.len;
-  stage.len = 0;
+  stats.bytes += fill->len;
+  part_bytes = fill->len;
+  fill->len = 0;
   last_flush_ms = timebase_ms();
   stats.state = LOGGER_LOGGING;
   if (put_sys(recovering ? LOGREC_EV_RECOVER : LOGREC_EV_START) != 0) { enter_fault(); return; }
@@ -197,38 +239,36 @@ static void do_open(void)
   }
 }
 
-/* LOGGING: drain the ring into JSON lines; write full stages, and at least once a second. */
+/* LOGGING: drain the ring into JSON lines; write full buffers, and at least once a second. */
 static void do_logging(void)
 {
-  char line[JSONL_MAX_LINE];
-  log_rec_t rec;
-  uint64_t now = timebase_now_us();
-  uint32_t n = 0;
+  const uint64_t part_size = (uint64_t)LOG_PREALLOC_MB * 1024 * 1024;
+  int full;
 
-  while (ringbuf_pop(&log_ring, &rec)) {
-    if ((++n & 0xFF) == 0) now = timebase_now_us();     /* keep "now" fresh during long drains */
-    stats.lines++;
-    if (put_line(line, jsonl_format(line, stats.boot_id, seq++, tk_extend_us(now, rec.t_us), &rec)) != 0) {
-      enter_fault();
-      return;
-    }
-    /* This part is nearly full: finish it and start the next one. */
-    if (part_bytes + stage.len + JSON_STAGING_BYTES > (uint64_t)LOG_PREALLOC_MB * 1024 * 1024) {
-      if (flush() != 0) { enter_fault(); return; }
+  for (;;) {
+    full = format_records();
+
+    /* This part is nearly full: finish it and start the next one. Nothing is formatted
+     * during this last write, so both buffers are empty when the next part opens. */
+    if (part_bytes + fill->len + 2 * JSON_STAGING_BYTES > part_size) {
+      if (flush(0) != 0) { enter_fault(); return; }
       storage_close();
       stats.state = LOGGER_OPEN;
       return;
     }
+    if (!full) break;
+    if (flush(1) != 0) { enter_fault(); return; }     /* the wait hook fills the other buffer meanwhile */
   }
-  if (timebase_ms() - last_flush_ms >= LOG_FLUSH_INTERVAL_MS && flush() != 0) enter_fault();
+  if (timebase_ms() - last_flush_ms >= LOG_FLUSH_INTERVAL_MS && flush(1) != 0) enter_fault();
 }
 
 void logger_init(void)
 {
-  static const SD_Hooks hooks = { app_yield, sd_progress };   /* while the card is busy, keep CAN going */
+  static const SD_Hooks hooks = { sd_wait, sd_progress };
 
   SD_SetHooks(&hooks);
-  jsonl_stage_init(&stage, stage_buf, sizeof stage_buf);
+  jsonl_stage_init(&stages[0], stage_buf[0], sizeof stage_buf[0]);
+  jsonl_stage_init(&stages[1], stage_buf[1], sizeof stage_buf[1]);
   stats.state = LOGGER_INIT;
 }
 

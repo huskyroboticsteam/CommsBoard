@@ -79,7 +79,7 @@ Every other line starts with the same four keys:
 | `rx` | A frame is received | `id`: 11-bit CAN ID as hex. `d`: the data bytes as hex; its length gives the DLC. `r`: 1 if it is a remote frame (then `d` is empty). |
 | `tx` | A frame this board sent was acknowledged on the bus | Same as `rx` |
 | `time` | Once a second | `rtc`: Unix seconds, or 0 if the RTC is not set |
-| `err` | The CAN error state changes | `tec`, `rec`: error counters. `lec`: last error code. `st`: `ok`, `warn`, `passive` or `busoff`. |
+| `err` | The CAN error state changes, or a protocol error happens on the bus | `tec`, `rec`: error counters. `lec`: last error code (0 none, 1 stuff, 2 form, 3 ACK, 4 bit1, 5 bit0, 6 CRC, 7 no new error). `st`: `ok`, `warn`, `passive` or `busoff`. |
 | `drop` | Space returns after an overflow; or right after `start`/`recover` if records were thrown away while nothing was being written | `cnt`: records lost. A lower bound: when the CAN hardware's own FIFO overflows, it does not say how many frames went. Records that waited more than 30 minutes with no card are thrown away rather than written with a timestamp that can no longer be worked out. |
 | `sys` | A logger or system event | `ev`: see below |
 | `tset` | The RTC is set | `old`, `new`: Unix seconds |
@@ -94,5 +94,7 @@ for later: `card_in`, `card_out`, `powerfail`, `fault`.
   arrive. A `sys` line is stamped when the logger writes it, so it can carry a later
   time than the frame lines right after it.
 - All frames collected by one receive interrupt share one timestamp.
+- On a bus where nobody acknowledges this board's frames, the controller keeps retrying
+  and every failed try writes an `err` line. Expect many of them.
 - After a card fault, the lines that were waiting in RAM are lost. The next part starts
   with a `recover` line, and `n` shows the gap.

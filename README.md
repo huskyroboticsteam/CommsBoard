@@ -37,7 +37,8 @@ There is no RTOS. `main()` runs one loop forever, and each pass runs three jobs 
 - **`can_task_poll`** moves records from the RX ring into the log ring and sends queued
   frames. It never waits: if the log ring is full, records are dropped and counted.
 - **`logger_poll`** is the only code that touches the card. It turns records into JSON
-  lines, packs whole lines into 512-byte blocks, and writes them.
+  lines, packs whole lines into 512-byte blocks, and writes them. It has two staging
+  buffers: while one is being written, records that arrive are formatted into the other.
 - **`status_poll`** blinks the heartbeat LED, prints a stats line every 5 s on the debug
   UART, and feeds the watchdog only while the loop is still making progress.
 
